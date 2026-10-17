@@ -286,6 +286,38 @@ def build_commands(s: dict) -> list[str]:
 MANIFEST_URL = ("https://raw.githubusercontent.com/MacMillan25/DarkFlasher/"
                 "main/firmware/manifest.json")
 
+# Релизы прошивки: теги вида darktec-v*, ассеты — <env>.uf2.
+RELEASES_API = ("https://api.github.com/repos/MacMillan25/MeshCore/"
+                "releases?per_page=30")
+
+
+def list_firmware_releases(timeout: float = 15.0) -> list[dict]:
+    """Список релизов прошивки: tag, name, date, files{env: url}."""
+    req = urllib.request.Request(RELEASES_API, headers={
+        "User-Agent": "DarkFlasher",
+        "Accept": "application/vnd.github+json",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = json.load(r)
+    out: list[dict] = []
+    for rel in data if isinstance(data, list) else []:
+        tag = rel.get("tag_name", "")
+        if not tag.startswith("darktec-"):
+            continue
+        files = {}
+        for a in rel.get("assets", []):
+            name = a.get("name", "")
+            if name.lower().endswith(".uf2"):
+                env = name[:-4]
+                files[env] = a.get("browser_download_url", "")
+        out.append({
+            "tag": tag,
+            "name": rel.get("name") or tag,
+            "date": (rel.get("published_at") or "")[:10],
+            "files": files,
+        })
+    return out
+
 
 def fetch_manifest(url: str = MANIFEST_URL, timeout: float = 15.0) -> dict:
     with urllib.request.urlopen(url, timeout=timeout) as r:

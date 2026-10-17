@@ -150,7 +150,10 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._pump)
         self.timer.start(70)
+        self.releases: list[dict] = []
+        self.selected_release: dict | None = None
         self.rescan_firmware()
+        self._load_releases()
 
     # ------------------------------------------------------------------ UI
     def _build(self) -> None:
@@ -170,7 +173,7 @@ class MainWindow(QMainWindow):
 
         titles = QVBoxLayout()
         titles.setSpacing(0)
-        t1 = QLabel(APP_NAME)
+        t1 = QLabel(APP_NAME + " 👾")
         t1.setObjectName("title")
         sub = QLabel(f"nRF52 · UF2 · v{APP_VERSION}")
         sub.setObjectName("subtitle")
@@ -181,14 +184,20 @@ class MainWindow(QMainWindow):
 
         self.badge = QFrame()
         self.badge.setObjectName("badge")
-        self.badge.setFixedHeight(24)
+        self.badge.setFixedHeight(26)
+        self.badge.setMinimumWidth(170)
         bl = QHBoxLayout(self.badge)
-        bl.setContentsMargins(10, 0, 10, 0)
+        bl.setContentsMargins(12, 0, 12, 0)
+        bl.setSpacing(7)
+        self.badge_dot = QLabel()
+        self.badge_dot.setFixedSize(9, 9)
+        bl.addWidget(self.badge_dot)
         self.badge_lbl = QLabel("НЕТ ПЛАТЫ")
         self.badge_lbl.setObjectName("badgeText")
         bl.addWidget(self.badge_lbl)
-        head.addWidget(self.badge)
+        head.addWidget(self.badge, 0, Qt.AlignmentFlag.AlignRight)
         root.addLayout(head)
+        self._set_badge(False)
 
         # role row
         row = QHBoxLayout()
@@ -210,10 +219,22 @@ class MainWindow(QMainWindow):
         btn_rescan = QPushButton("Обновить")
         btn_rescan.clicked.connect(self.rescan_firmware)
         row.addWidget(btn_rescan)
-        btn_pick = QPushButton("Выбрать…")
-        btn_pick.clicked.connect(self.choose_file)
-        row.addWidget(btn_pick)
         root.addLayout(row)
+
+        # версия прошивки
+        vrow = QHBoxLayout()
+        vrow.setSpacing(8)
+        v_title = QLabel("ВЕРСИЯ")
+        v_title.setObjectName("section")
+        vrow.addWidget(v_title)
+        self.version_box = QComboBox()
+        self.version_box.addItem("загружаю список…")
+        self.version_box.setMinimumWidth(240)
+        self.version_box.setEnabled(False)
+        self.version_box.currentIndexChanged.connect(self._on_version_change)
+        vrow.addWidget(self.version_box, 2)
+        vrow.addStretch(1)
+        root.addLayout(vrow)
 
         self.fw_lbl = QLabel("")
         self.fw_lbl.setObjectName("hint")
@@ -289,15 +310,13 @@ class MainWindow(QMainWindow):
                       hint: str = "", width: int = 130) -> None:
             lb = QLabel(label)
             lb.setObjectName("fieldLabel")
-            grid.addWidget(lb, row, col * 3)
+            grid.addWidget(lb, row, col * 2)
             ed = QLineEdit(str(self.settings.get(key, "")))
             ed.setFixedWidth(width)
-            ed.textChanged.connect(self._on_setting_changed)
-            grid.addWidget(ed, row, col * 3 + 1)
             if hint:
-                h = QLabel(hint)
-                h.setObjectName("hint")
-                grid.addWidget(h, row, col * 3 + 2)
+                ed.setPlaceholderText(hint)
+            ed.textChanged.connect(self._on_setting_changed)
+            grid.addWidget(ed, row, col * 2 + 1)
             self.fields[key] = ed
 
         add_field(0, 0, "Имя ноды", "name", "не задано — не менять")
@@ -311,7 +330,7 @@ class MainWindow(QMainWindow):
 
         mod_lb = QLabel("Модуль")
         mod_lb.setObjectName("fieldLabel")
-        grid.addWidget(mod_lb, 2, 3)
+        grid.addWidget(mod_lb, 2, 2)
         self.module_box = QComboBox()
         for _i, title in cfg.MODULES:
             self.module_box.addItem(title)
@@ -321,7 +340,7 @@ class MainWindow(QMainWindow):
         self.module_box.currentTextChanged.connect(
             lambda _t: self._on_setting_changed())
         self.module_box.setFixedWidth(150)
-        grid.addWidget(self.module_box, 2, 4)
+        grid.addWidget(self.module_box, 2, 3)
         root.addLayout(grid)
 
         self.send_cb = QCheckBox("отправлять настройки после прошивки")
@@ -371,6 +390,11 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ лог
     def log_msg(self, text: str, kind: str = "info") -> None:
+        low = text.lower()
+        if kind == "info" and any(w in low for w in (
+                "ошибка", "не удалось", "не появилась", "не найден",
+                "не скачалось", "не отправлен", "недоступен", "отклонена")):
+            kind = "err"
         color = {"ok": "#4ea583", "warn": "#d9a054", "err": "#d96a6a",
                  "dim": "#5d6a7c"}.get(kind, "#98a3b3")
         t = time.strftime("%H:%M:%S")
@@ -468,12 +492,62 @@ class MainWindow(QMainWindow):
         if path:
             self._apply_file(path)
 
+    def _load_releases(self) -> None:
+        def work() -> None:
+            try:
+                rel = cfg.list_firmware_releases()
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("log", f"список версий недоступен: {e}", "err"))
+                self.q.put(("releases", []))
+                return
+            self.q.put(("releases", rel))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _populate_versions(self, releases: list[dict]) -> None:
+        self.releases = releases
+        self.version_box.blockSignals(True)
+        self.version_box.clear()
+        if not releases:
+            self.version_box.addItem("нет релизов прошивки")
+            self.version_box.setEnabled(False)
+            self.version_box.blockSignals(False)
+            return
+        for r in releases:
+            label = f"{r['tag']} · {r['date']}" if r["date"] else r["tag"]
+            self.version_box.addItem(label)
+        self.version_box.setEnabled(True)
+        self.version_box.blockSignals(False)
+        self._on_version_change(0)
+
+    def _on_version_change(self, index: int) -> None:
+        if 0 <= index < len(self.releases):
+            self.selected_release = self.releases[index]
+            self.log_msg(
+                f"версия прошивки: {self.selected_release['tag']} · "
+                f"{self.selected_release['date']}", "dim")
+
     def download_online(self) -> None:
         if self.busy:
             return
         env = self._env()
         if not env:
             return
+        rel = self.selected_release
+        if rel and rel.get("files", {}).get(env):
+            self.log_msg(f"качаю {rel['tag']} для роли "
+                         f"«{cfg.role_title(self.role_slug)}»", "info")
+
+            def work_rel() -> None:
+                path = cfg.download_firmware(
+                    env, rel["files"][env],
+                    log=lambda m: self.q.put(("log", m, "dim")))
+                if path:
+                    self.q.put(("online_ready", path))
+
+            threading.Thread(target=work_rel, daemon=True).start()
+            return
+
         self.log_msg("читаю манифест с GitHub…", "info")
 
         def work() -> None:
@@ -619,6 +693,8 @@ class MainWindow(QMainWindow):
                 elif kind == "online_ready":
                     self.log_msg("прошивка скачана", "ok")
                     self._apply_file(ev[1])
+                elif kind == "releases":
+                    self._populate_versions(ev[1])
                 elif kind == "settings_progress":
                     self.set_progress(ev[1])
                 elif kind == "settings_done":
@@ -631,15 +707,24 @@ class MainWindow(QMainWindow):
         except queue.Empty:
             pass
 
-    def _update_badge(self) -> None:
-        if self.vols:
+    def _set_badge(self, connected: bool) -> None:
+        if connected:
             self.badge_lbl.setText("ПЛАТА ПОДКЛЮЧЕНА")
+            self.badge_dot.setStyleSheet(
+                "background:#4ea583;border-radius:4px;")
             self.badge.setStyleSheet(
                 "QFrame#badge{background:#14301f;border:1px solid #2f7a5f;"
-                "border-radius:11px;}")
+                "border-radius:13px;}")
         else:
             self.badge_lbl.setText("НЕТ ПЛАТЫ")
-            self.badge.setStyleSheet("")
+            self.badge_dot.setStyleSheet(
+                "background:#d96a6a;border-radius:4px;")
+            self.badge.setStyleSheet(
+                "QFrame#badge{background:#2a1618;border:1px solid #6e2f35;"
+                "border-radius:13px;}")
+
+    def _update_badge(self) -> None:
+        self._set_badge(bool(self.vols))
 
     def _on_flash(self, res: FlashResult) -> None:
         self.busy = False
