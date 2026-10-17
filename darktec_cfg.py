@@ -15,6 +15,10 @@ CONFIG_NAME = "darkflasher.json"
 FIRMWARE_DIR_NAME = "firmware"
 SERIAL_BAUD = 115200
 
+# Бинарный протокол компаньона (MyMesh.cpp): кадр `<` + len16 + payload.
+CMD_RUN_CLI = 66       # CMD_RUN_CLI_COMMAND, v14+
+RESP_CLI_REPLY = 29    # RESP_CODE_CLI_REPLY
+
 # VID, по которым узнаём nRF52: Adafruit (bootloader и core) и Nordic.
 NRF_VIDS = {0x239A, 0x1915}
 
@@ -202,7 +206,9 @@ def open_serial(port: str):
     ser.baudrate = SERIAL_BAUD
     ser.timeout = 0.2
     ser.write_timeout = 3
-    ser.dtr = False
+    # DTR поднимаем (как обычный терминал), RTS не трогаем: на nRF CDC это
+    # не сброс, а чужой порт мы всё равно не открываем.
+    ser.dtr = True
     ser.rts = False
     ser.open()
     return ser
@@ -355,10 +361,11 @@ def download_firmware(env: str, url: str, log=print) -> str | None:
 
 def send_commands_batch(port: str, commands: list[str], log=print,
                         progress=None) -> bool:
-    """Отправляет все команды одной посылкой, затем reboot.
+    """Шлёт CLI-команды через бинарный протокол компаньона.
 
-    Быстрее, чем по одной: нода разбирает входной буфер построчно, ответы
-    приходят пачкой. `progress(0..1)` — для единого индикатора записи.
+    Компаньон на USB — не текстовый терминал: кадр `<` + len + payload,
+    payload[0] = 66 (CMD_RUN_CLI_COMMAND), внутри — ASCII команды.
+    Ответ: `>` + len + payload, payload[0] = 29 (CLI reply).
     """
     ok = True
     try:
@@ -367,26 +374,32 @@ def send_commands_batch(port: str, commands: list[str], log=print,
         log(f"COM {port}: {e}")
         return False
     try:
-        time.sleep(0.4)
+        time.sleep(0.3)
         ser.reset_input_buffer()
-        payload = "".join(c + "\r\n" for c in commands)
-        ser.write(payload.encode("ascii", "replace"))
-        ser.flush()
-        log(f"> {len(commands)} команд одной посылкой")
-        if progress:
-            progress(0.6)
-        time.sleep(1.2)
-        reply = _read_reply(ser, 2.0)
+        for cmd in commands:
+            payload = bytes([CMD_RUN_CLI]) + cmd.encode("ascii", "replace")
+            frame = (b"<" + bytes([len(payload) & 0xFF,
+                                   (len(payload) >> 8) & 0xFF]) + payload)
+            ser.write(frame)
+            ser.flush()
+            log(f"> {cmd}")
+            if progress:
+                progress(0.3 + 0.5 * (commands.index(cmd) + 1) / len(commands))
+            reply = _read_cli_reply(ser, timeout=2.5)
+            if reply:
+                log(f"< {reply}")
+                low = reply.lower()
+                if "error" in low or "unknown" in low:
+                    ok = False
+                    log(f"команда не принята: {cmd}")
+            else:
+                log(f"< (нет ответа на {cmd})")
         if progress:
             progress(1.0)
-        for line in reply.splitlines():
-            log(f"< {line}")
-        low = reply.lower()
-        if "error" in low or "unknown" in low:
-            ok = False
-            log("часть команд отклонена — смотри ответы выше")
-        # Перезагрузка: применяет freq/bw/sf/cr/tx.
-        ser.write(b"reboot\r\n")
+        # перезагрузка, чтобы freq/bw/sf/cr/tx применились
+        payload = bytes([CMD_RUN_CLI]) + b"reboot"
+        ser.write(b"<" + bytes([len(payload) & 0xFF,
+                                (len(payload) >> 8) & 0xFF]) + payload)
         ser.flush()
         time.sleep(0.3)
     except Exception as e:  # noqa: BLE001
@@ -398,3 +411,29 @@ def send_commands_batch(port: str, commands: list[str], log=print,
         except Exception:
             pass
     return ok
+
+
+def _read_cli_reply(ser, timeout: float = 2.5) -> str:
+    """Читает один кадр `>` + len + payload и возвращает текст CLI-ответа."""
+    deadline = time.time() + timeout
+    buf = b""
+    while time.time() < deadline:
+        try:
+            chunk = ser.read(256)
+        except Exception:
+            break
+        if chunk:
+            buf += chunk
+            # ищем кадр
+            while b">" in buf:
+                i = buf.index(b">")
+                if len(buf) < i + 3:
+                    break
+                ln = buf[i + 1] | (buf[i + 2] << 8)
+                if len(buf) < i + 3 + ln:
+                    break
+                payload = buf[i + 3:i + 3 + ln]
+                buf = buf[i + 3 + ln:]
+                if payload and payload[0] == RESP_CLI_REPLY:
+                    return payload[1:].decode("utf-8", "replace").strip()
+    return ""

@@ -14,7 +14,7 @@ import time
 from PyQt6.QtCore import Qt, QTimer, QVariantAnimation, QEasingCurve
 from PyQt6.QtGui import QFont, QIcon, QPixmap, QPainter, QColor, QPen, QFontMetrics
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
+    QApplication, QComboBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout,
     QLabel, QLineEdit, QMainWindow, QTextEdit, QProgressBar, QPushButton,
     QSizePolicy, QVBoxLayout, QWidget, QCheckBox,
 )
@@ -301,36 +301,39 @@ class MainWindow(QMainWindow):
         sec.setObjectName("section")
         root.addWidget(sec)
 
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(8)
+        forms = QHBoxLayout()
+        forms.setSpacing(26)
         self.fields: dict[str, QLineEdit] = {}
+        left = QFormLayout()
+        right = QFormLayout()
+        for f in (left, right):
+            f.setHorizontalSpacing(10)
+            f.setVerticalSpacing(9)
+            f.setLabelAlignment(Qt.AlignmentFlag.AlignRight |
+                                Qt.AlignmentFlag.AlignVCenter)
 
-        def add_field(col: int, row: int, label: str, key: str,
-                      hint: str = "", width: int = 130) -> None:
+        def add_field(form: QFormLayout, label: str, key: str,
+                      hint: str = "") -> None:
             lb = QLabel(label)
             lb.setObjectName("fieldLabel")
-            grid.addWidget(lb, row, col * 2)
             ed = QLineEdit(str(self.settings.get(key, "")))
-            ed.setFixedWidth(width)
             if hint:
                 ed.setPlaceholderText(hint)
+            ed.setMinimumWidth(150)
             ed.textChanged.connect(self._on_setting_changed)
-            grid.addWidget(ed, row, col * 2 + 1)
+            form.addRow(lb, ed)
             self.fields[key] = ed
 
-        add_field(0, 0, "Имя ноды", "name", "не задано — не менять")
-        add_field(0, 1, "Частота, МГц", "freq")
-        add_field(0, 2, "Полоса, кГц", "bw")
-        add_field(0, 3, "SF", "sf", "5..12", 70)
-        add_field(0, 4, "CR", "cr", "5..8", 70)
-        add_field(1, 0, "Мощность, dBm", "tx", "-9..22", 70)
-        add_field(1, 1, "Ёмкость, мАч", "capacity", "1000..10000", 90)
-        add_field(1, 3, "Коэф. АЦП", "adc", "1.750", 90)
+        add_field(left, "Имя ноды", "name", "не задано")
+        add_field(left, "Частота, МГц", "freq")
+        add_field(left, "Полоса, кГц", "bw")
+        add_field(left, "SF", "sf", "5..12")
+        add_field(left, "CR", "cr", "5..8")
+        add_field(right, "Мощность, dBm", "tx", "-9..22")
+        add_field(right, "Ёмкость, мАч", "capacity", "1000..10000")
 
         mod_lb = QLabel("Модуль")
         mod_lb.setObjectName("fieldLabel")
-        grid.addWidget(mod_lb, 2, 2)
         self.module_box = QComboBox()
         for _i, title in cfg.MODULES:
             self.module_box.addItem(title)
@@ -339,9 +342,13 @@ class MainWindow(QMainWindow):
         self.module_box.setCurrentIndex(idx)
         self.module_box.currentTextChanged.connect(
             lambda _t: self._on_setting_changed())
-        self.module_box.setFixedWidth(150)
-        grid.addWidget(self.module_box, 2, 3)
-        root.addLayout(grid)
+        self.module_box.setMinimumWidth(150)
+        right.addRow(mod_lb, self.module_box)
+
+        add_field(right, "Коэф. АЦП", "adc", "1.750")
+        forms.addLayout(left, 1)
+        forms.addLayout(right, 1)
+        root.addLayout(forms)
 
         self.send_cb = QCheckBox("отправлять настройки после прошивки")
         self.send_cb.setChecked(bool(self.settings.get("send_after_flash", True)))
