@@ -112,6 +112,7 @@ QFrame#badge {
     background: #161e2b; border: 1px solid #222c3c; border-radius: 11px;
 }
 QLabel#badgeText { color: #98a3b3; font-size: 11px; font-weight: 600; }
+QFrame#badge QLabel, QFrame#dropZone QLabel { background: transparent; }
 """
 
 
@@ -135,8 +136,8 @@ class MainWindow(QMainWindow):
         self._progress = 0
 
         self.setWindowTitle("Dark Flasher — nRF52 UF2")
-        self.setMinimumSize(780, 900)
-        self.resize(820, 940)
+        self.setMinimumSize(820, 1040)
+        self.resize(880, 1090)
         self.setAcceptDrops(True)
         icon = os.path.join(cfg.app_dir(), "app.ico")
         if os.path.isfile(icon):
@@ -167,8 +168,12 @@ class MainWindow(QMainWindow):
         head = QHBoxLayout()
         head.setSpacing(12)
         logo = QLabel()
-        logo.setPixmap(self._logo_pixmap(38))
-        logo.setFixedSize(38, 38)
+        icon_path = os.path.join(cfg.app_dir(), "app.ico")
+        if os.path.isfile(icon_path):
+            logo.setPixmap(QIcon(icon_path).pixmap(36, 36))
+        else:
+            logo.setPixmap(self._logo_pixmap(36))
+        logo.setFixedSize(36, 36)
         head.addWidget(logo)
 
         titles = QVBoxLayout()
@@ -319,7 +324,7 @@ class MainWindow(QMainWindow):
             ed = QLineEdit(str(self.settings.get(key, "")))
             if hint:
                 ed.setPlaceholderText(hint)
-            ed.setMinimumWidth(150)
+            ed.setFixedWidth(210)
             ed.textChanged.connect(self._on_setting_changed)
             form.addRow(lb, ed)
             self.fields[key] = ed
@@ -342,7 +347,7 @@ class MainWindow(QMainWindow):
         self.module_box.setCurrentIndex(idx)
         self.module_box.currentTextChanged.connect(
             lambda _t: self._on_setting_changed())
-        self.module_box.setMinimumWidth(150)
+        self.module_box.setFixedWidth(210)
         right.addRow(mod_lb, self.module_box)
 
         add_field(right, "Коэф. АЦП", "adc", "1.750")
@@ -375,7 +380,7 @@ class MainWindow(QMainWindow):
         root.addWidget(log_sec)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
-        self.log.setMinimumHeight(230)
+        self.log.setMinimumHeight(260)
         root.addWidget(self.log, 1)
 
     def _logo_pixmap(self, size: int) -> QPixmap:
