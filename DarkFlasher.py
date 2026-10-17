@@ -39,6 +39,8 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime
 
+import darktec_cfg as cfg
+
 APP_NAME = "Dark Flasher"
 APP_VERSION = "1.1"
 WINDOW_TITLE = "Dark Flasher — nRF52 UF2"
@@ -741,6 +743,11 @@ class App:
         self._drop_queue: list[int] = []
         self._drop_seen: set[int] = set()
 
+        # Настройки DarkTec и порт до прошивки: после ребута нода поднимет
+        # новый COM, его и ждём, чтобы отправить конфигурацию.
+        self.settings = cfg.load_settings()
+        self._ports_before: list[str] = cfg.list_ports()
+
         root.title(WINDOW_TITLE)
         root.configure(bg=BG)
         root.resizable(False, False)
@@ -749,7 +756,7 @@ class App:
         root.bind("<Control-o>", lambda _e: self.choose_file())
 
         self.W = X(620)
-        self.H = X(560)
+        self.H = X(690)
         sw = root.winfo_screenwidth()
         sh = root.winfo_screenheight()
         x = max(0, (sw - self.W) // 2)
@@ -833,18 +840,54 @@ class App:
                                 font=self.f_status, anchor="e")
         self.pct_lbl.place(x=X(536), y=X(316), width=X(60), height=X(18))
 
+        # role + settings row ---------------------------------------------
+        tk.Label(root, text="РОЛЬ", bg=BG, fg=FAINT,
+                 font=self.f_badge).place(x=X(24), y=X(350))
+        self.role_var = tk.StringVar(value=cfg.role_title(self.settings.get("role", "")))
+        self.role_menu = tk.OptionMenu(root, self.role_var,
+                                       *[t for _s, t, _e in cfg.ROLES],
+                                       command=self.on_role_change)
+        self.role_menu.configure(bg=PANEL2, fg=TEXT, activebackground=BORDER,
+                                 activeforeground=TEXT, bd=0, relief="flat",
+                                 highlightthickness=0, font=self.f_meta,
+                                 anchor="w", padx=X(8))
+        self.role_menu["menu"].configure(bg=PANEL2, fg=TEXT,
+                                         activebackground=BORDER,
+                                         activeforeground=TEXT, font=self.f_meta)
+        self.role_menu.place(x=X(64), y=X(343), width=X(232), height=X(26))
+
+        self.btn_settings = tk.Button(root, text="Настройки…",
+                                      command=self.open_settings,
+                                      bg=PANEL2, fg=TEXT, activebackground=BORDER,
+                                      activeforeground=TEXT, bd=0, relief="flat",
+                                      highlightthickness=0, font=self.f_meta,
+                                      cursor="hand2")
+        self.btn_settings.place(x=X(304), y=X(343), width=X(118), height=X(26))
+
+        self.btn_role = tk.Button(root, text="Прошить роль",
+                                  command=self.flash_role,
+                                  bg=ACCENT_DARK, fg=TEXT, activebackground=ACCENT,
+                                  activeforeground=BG, bd=0, relief="flat",
+                                  highlightthickness=0, font=self.f_meta,
+                                  cursor="hand2")
+        self.btn_role.place(x=X(430), y=X(343), width=X(166), height=X(26))
+
+        self.fw_lbl = tk.Label(root, text="", bg=BG, fg=FAINT,
+                               font=self.f_meta, anchor="w")
+        self.fw_lbl.place(x=X(24), y=X(374), width=X(572), height=X(18))
+
         # divider + log ----------------------------------------------------
         tk.Frame(root, bg=BORDER, height=X(1), bd=0).place(
-            x=X(24), y=X(344), width=self.zone_w, height=X(1))
+            x=X(24), y=X(404), width=self.zone_w, height=X(1))
         tk.Label(root, text="ЛОГ", bg=BG, fg=FAINT,
-                 font=self.f_badge).place(x=X(24), y=X(352))
+                 font=self.f_badge).place(x=X(24), y=X(412))
 
         self.logw = tk.Text(root, bg=PANEL, fg=DIM, bd=0, relief="flat",
                             highlightthickness=0, wrap="word",
                             font=self.f_log, padx=X(10), pady=X(8),
                             insertbackground=TEXT, selectbackground=BLUE_DARK,
                             cursor="arrow", spacing1=X(1), spacing3=X(1))
-        self.logw.place(x=X(24), y=X(368), width=self.zone_w, height=X(170))
+        self.logw.place(x=X(24), y=X(426), width=self.zone_w, height=X(236))
         self.logw.tag_configure("time", foreground=FAINT)
         self.logw.tag_configure("dim", foreground=FAINT)
         self.logw.tag_configure("info", foreground=DIM)
@@ -856,6 +899,184 @@ class App:
         self._draw_progress()
         self._draw_badge()
         self._redraw_zone()
+        self._refresh_fw_label()
+
+    # ------------------------------------------------------- роль и настройки
+    def on_role_change(self, title: str) -> None:
+        for slug, t, _env in cfg.ROLES:
+            if t == title:
+                self.settings["role"] = slug
+                cfg.save_settings(self.settings)
+                break
+        self._refresh_fw_label()
+
+    def _current_env(self) -> str | None:
+        return cfg.ROLE_ENVS.get(self.settings.get("role", ""))
+
+    def _refresh_fw_label(self) -> None:
+        env = self._current_env()
+        if not env:
+            self.fw_lbl.configure(text="")
+            return
+        path = cfg.find_local_firmware(env)
+        if path:
+            self.fw_lbl.configure(text=f"прошивка: {os.path.basename(path)}",
+                                  fg=ACCENT)
+        else:
+            self.fw_lbl.configure(
+                text=f"прошивки нет — положи {env}.uf2 в папку fw/ "
+                     f"или укажи URL в fw/manifest.json", fg=WARN)
+
+    def open_settings(self) -> None:
+        tk = self.tk
+        win = tk.Toplevel(self.root)
+        win.title("Настройки DarkTec")
+        win.configure(bg=BG)
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.grab_set()
+
+        s = dict(self.settings)
+        vars_: dict[str, object] = {}
+        fields = [
+            ("name", "Имя ноды", "пусто — не менять"),
+            ("freq", "Частота, МГц", "869.900"),
+            ("bw", "Полоса, кГц", "62.5"),
+            ("sf", "SF", "5..12"),
+            ("cr", "CR", "5..8"),
+            ("tx", "Мощность, dBm", "-9..22"),
+            ("capacity", "Ёмкость, мАч", "1000..10000"),
+            ("adc", "Коэф. АЦП", "1.750"),
+        ]
+        y = 18
+        for key, label, hint in fields:
+            tk.Label(win, text=label, bg=BG, fg=DIM, font=self.f_meta,
+                     anchor="w").place(x=16, y=y, width=130, height=20)
+            v = tk.StringVar(value=str(s.get(key, "")))
+            tk.Entry(win, textvariable=v, bg=PANEL2, fg=TEXT,
+                     insertbackground=TEXT, bd=0, relief="flat",
+                     highlightthickness=1, highlightbackground=BORDER,
+                     highlightcolor=ACCENT,
+                     font=self.f_meta).place(x=150, y=y - 2, width=110, height=23)
+            tk.Label(win, text=hint, bg=BG, fg=FAINT, font=self.f_meta,
+                     anchor="w").place(x=268, y=y, width=110, height=20)
+            vars_[key] = v
+            y += 32
+
+        # модуль
+        tk.Label(win, text="Модуль", bg=BG, fg=DIM, font=self.f_meta,
+                 anchor="w").place(x=16, y=y, width=130, height=20)
+        mod_titles = [t for _i, t in cfg.MODULES]
+        cur_mod = int(s.get("module", 0))
+        cur_title = cfg.MODULES[cur_mod][1] if 0 <= cur_mod < len(cfg.MODULES) else mod_titles[0]
+        mod_var = tk.StringVar(value=cur_title)
+        om = tk.OptionMenu(win, mod_var, *mod_titles)
+        om.configure(bg=PANEL2, fg=TEXT, activebackground=BORDER,
+                     activeforeground=TEXT, bd=0, relief="flat",
+                     highlightthickness=0, font=self.f_meta, anchor="w")
+        om["menu"].configure(bg=PANEL2, fg=TEXT, activebackground=BORDER,
+                             activeforeground=TEXT, font=self.f_meta)
+        om.place(x=150, y=y - 3, width=150, height=25)
+        y += 34
+
+        send_var = tk.BooleanVar(value=bool(s.get("send_after_flash", True)))
+        tk.Checkbutton(win, text="отправлять настройки после прошивки",
+                       variable=send_var, bg=BG, fg=DIM,
+                       activebackground=BG, activeforeground=TEXT,
+                       selectcolor=PANEL2, font=self.f_meta,
+                       anchor="w").place(x=16, y=y, width=330, height=24)
+        y += 38
+
+        def do_save() -> None:
+            try:
+                new = dict(s)
+                new["name"] = str(vars_["name"].get()).strip()
+                new["freq"] = float(str(vars_["freq"].get()).replace(",", "."))
+                new["bw"] = float(str(vars_["bw"].get()).replace(",", "."))
+                new["sf"] = int(vars_["sf"].get())
+                new["cr"] = int(vars_["cr"].get())
+                new["tx"] = int(vars_["tx"].get())
+                new["capacity"] = int(vars_["capacity"].get())
+                new["adc"] = float(str(vars_["adc"].get()).replace(",", "."))
+            except ValueError:
+                self.messagebox.showerror("Настройки", "число записано неверно",
+                                          parent=win)
+                return
+            if not 1000 <= new["capacity"] <= 10000:
+                self.messagebox.showerror("Настройки",
+                                          "ёмкость: 1000..10000 мАч", parent=win)
+                return
+            for k in ("sf", "cr"):
+                if not 5 <= new[k] <= 12:
+                    self.messagebox.showerror("Настройки", f"{k}: 5..12", parent=win)
+                    return
+            if not -9 <= new["tx"] <= 22:
+                self.messagebox.showerror("Настройки", "мощность: -9..22 dBm",
+                                          parent=win)
+                return
+            new["module"] = next(i for i, t in cfg.MODULES if t == mod_var.get())
+            new["send_after_flash"] = bool(send_var.get())
+            self.settings = new
+            cfg.save_settings(new)
+            self.log("настройки сохранены", "ok")
+            win.destroy()
+
+        tk.Button(win, text="Сохранить", command=do_save,
+                  bg=ACCENT_DARK, fg=TEXT, activebackground=ACCENT,
+                  activeforeground=BG, bd=0, relief="flat",
+                  highlightthickness=0, font=self.f_meta,
+                  cursor="hand2").place(x=16, y=y, width=150, height=28)
+        tk.Button(win, text="Отмена", command=win.destroy,
+                  bg=PANEL2, fg=TEXT, activebackground=BORDER,
+                  activeforeground=TEXT, bd=0, relief="flat",
+                  highlightthickness=0, font=self.f_meta,
+                  cursor="hand2").place(x=178, y=y, width=110, height=28)
+
+        win.geometry(f"{X(420)}x{X(y + 52)}")
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + (self.W - win.winfo_width()) // 2
+        yy = self.root.winfo_rooty() + 60
+        win.geometry(f"+{max(0, x)}+{max(0, yy)}")
+
+    def flash_role(self) -> None:
+        if self.busy:
+            self.log("идёт запись — дождись окончания", "warn")
+            return
+        env = self._current_env()
+        if not env:
+            return
+        self._ports_before = cfg.list_ports()
+        path = cfg.resolve_firmware(env, log=lambda m: self.q.put(("log", m, "info")))
+        if not path:
+            self.log("прошивка не найдена: положи .uf2 в fw/ "
+                     "или добавь URL в fw/manifest.json", "err")
+            self._refresh_fw_label()
+            return
+        self.log(f"роль: {cfg.role_title(self.settings.get('role', ''))} · "
+                 f"{os.path.basename(path)}", "ok")
+        self._refresh_fw_label()
+        self.on_drop([path])
+
+    def _start_settings_send(self) -> None:
+        if not self.settings.get("send_after_flash", True):
+            return
+        cmds = cfg.build_commands(self.settings)
+        self.log("жду COM-порт ноды для отправки настроек…", "info")
+
+        def work() -> None:
+            port = cfg.wait_for_new_port(self._ports_before, timeout=15.0)
+            if not port:
+                self.q.put(("log", "COM-порт не появился за 15 с — "
+                                   "настройки НЕ отправлены", "err"))
+                self.q.put(("settings_done", False))
+                return
+            self.q.put(("log", f"порт {port}: отправляю настройки", "ok"))
+            ok = cfg.send_commands(port, cmds,
+                                   log=lambda m: self.q.put(("log", m, "dim")))
+            self.q.put(("settings_done", ok))
+
+        threading.Thread(target=work, daemon=True).start()
+
 
     def _draw_logo(self, c, w: int, h: int) -> None:
         tk = self.tk
@@ -1255,6 +1476,13 @@ class App:
                     self._status(event[1])
                 elif kind == "log":
                     self.log(event[1], event[2])
+                elif kind == "settings_done":
+                    if event[1]:
+                        self.log("настройки записаны в ноду", "ok")
+                        self._status("прошивка и настройки готовы")
+                    else:
+                        self.log("настройки записаны не полностью — "
+                                 "проверь лог", "warn")
         except queue.Empty:
             pass
         self.root.after(60, self._pump)
@@ -1301,6 +1529,8 @@ class App:
                 self._set_state("warn")
                 self._status("файл записан, но плата не перезагрузилась — нажми Reset")
                 self.log("файл записан, но том не исчез — плата не ушла в ребут", "warn")
+            # После прошивки нода поднимает USB-CDC: пишем в неё конфигурацию.
+            self._start_settings_send()
         else:
             self.progress = max(0.0, res.written / res.total) if res.total else 0.0
             short = res.message
