@@ -209,19 +209,17 @@ class MainWindow(QMainWindow):
         row.setSpacing(8)
         role_title = QLabel("РОЛЬ")
         role_title.setObjectName("section")
+        role_title.setFixedWidth(70)
         row.addWidget(role_title)
         self.role_box = QComboBox()
         for _slug, title, _env in cfg.ROLES:
             self.role_box.addItem(title)
         self.role_box.setCurrentText(cfg.role_title(self.role_slug))
         self.role_box.currentTextChanged.connect(self.on_role_change)
-        self.role_box.setFixedWidth(200)
+        self.role_box.setFixedWidth(220)
         row.addWidget(self.role_box)
         row.addStretch(1)
 
-        btn_rescan = QPushButton("Обновить")
-        btn_rescan.clicked.connect(self.rescan_firmware)
-        row.addWidget(btn_rescan)
         root.addLayout(row)
 
         # версия прошивки
@@ -229,10 +227,11 @@ class MainWindow(QMainWindow):
         vrow.setSpacing(8)
         v_title = QLabel("ВЕРСИЯ")
         v_title.setObjectName("section")
+        v_title.setFixedWidth(70)
         vrow.addWidget(v_title)
         self.version_box = QComboBox()
         self.version_box.addItem("загружаю список…")
-        self.version_box.setMinimumWidth(240)
+        self.version_box.setFixedWidth(220)
         self.version_box.setEnabled(False)
         self.version_box.currentIndexChanged.connect(self._on_version_change)
         vrow.addWidget(self.version_box, 2)
@@ -391,6 +390,9 @@ class MainWindow(QMainWindow):
         for text, url in (
             ("Группа в Telegram", "https://t.me/DarkElectronics"),
             ("Покупка нод DarkTec", "https://t.me/Dark_Electronics"),
+            ("Прошивки beeline09", "https://beeline09.github.io/darktec/"),
+            ("Документация на плату",
+             "https://disk.yandex.ru/i/_Y-lxwDZrS1TRA"),
         ):
             lb = QLabel(f'<a href="{url}" style="color:#4ea583;'
                         f'text-decoration:none;">{text}</a>')
