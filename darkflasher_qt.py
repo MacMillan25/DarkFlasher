@@ -34,7 +34,7 @@ QWidget {
     font-weight: 600;
     font-size: 13px;
 }
-QLabel#title { font-size: 19px; font-weight: 700; }
+QLabel#title { font-size: 34px; font-weight: 700; }
 QLabel#subtitle { color: #5d6a7c; font-size: 11px; }
 QLabel#section { color: #5d6a7c; font-size: 11px; font-weight: 700; }
 QLabel#fieldLabel { color: #98a3b3; }
@@ -204,27 +204,29 @@ class MainWindow(QMainWindow):
         root.addLayout(head)
         self._set_badge(False)
 
-        # role row
-        row = QHBoxLayout()
-        row.setSpacing(8)
+        # роль + версия слева, зона drag&drop справа
+        top = QHBoxLayout()
+        top.setSpacing(14)
+
+        left = QVBoxLayout()
+        left.setSpacing(6)
+
+        rrow = QHBoxLayout()
         role_title = QLabel("РОЛЬ")
         role_title.setObjectName("section")
         role_title.setFixedWidth(70)
-        row.addWidget(role_title)
+        rrow.addWidget(role_title)
         self.role_box = QComboBox()
         for _slug, title, _env in cfg.ROLES:
             self.role_box.addItem(title)
         self.role_box.setCurrentText(cfg.role_title(self.role_slug))
         self.role_box.currentTextChanged.connect(self.on_role_change)
         self.role_box.setFixedWidth(220)
-        row.addWidget(self.role_box)
-        row.addStretch(1)
+        rrow.addWidget(self.role_box)
+        rrow.addStretch(1)
+        left.addLayout(rrow)
 
-        root.addLayout(row)
-
-        # версия прошивки
         vrow = QHBoxLayout()
-        vrow.setSpacing(8)
         v_title = QLabel("ВЕРСИЯ")
         v_title.setObjectName("section")
         v_title.setFixedWidth(70)
@@ -234,38 +236,40 @@ class MainWindow(QMainWindow):
         self.version_box.setFixedWidth(220)
         self.version_box.setEnabled(False)
         self.version_box.currentIndexChanged.connect(self._on_version_change)
-        vrow.addWidget(self.version_box, 2)
+        vrow.addWidget(self.version_box)
         vrow.addStretch(1)
-        root.addLayout(vrow)
-
-        self.fw_lbl = QLabel("")
-        self.fw_lbl.setObjectName("hint")
-        self.fw_lbl.setWordWrap(False)
-        root.addWidget(self.fw_lbl)
+        left.addLayout(vrow)
+        top.addLayout(left, 0)
 
         or_lbl = QLabel("ИЛИ")
         or_lbl.setObjectName("orLabel")
+        or_lbl.setFixedWidth(44)
         or_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        root.addWidget(or_lbl)
+        top.addWidget(or_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        # drop zone
         self.drop = QFrame()
         self.drop.setObjectName("dropZone")
-        self.drop.setMinimumHeight(92)
+        self.drop.setMinimumHeight(84)
         self.drop.setSizePolicy(QSizePolicy.Policy.Expanding,
                                 QSizePolicy.Policy.Fixed)
         dl = QVBoxLayout(self.drop)
-        dl.setContentsMargins(10, 10, 10, 10)
+        dl.setContentsMargins(8, 8, 8, 8)
         arrow = QLabel("⭳")
         arrow.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        arrow.setStyleSheet("color:#4ea583; font-size:26px;")
+        arrow.setStyleSheet("color:#4ea583; font-size:22px;")
         dl.addWidget(arrow)
         dz = QLabel("перетащи .uf2 сюда или нажми, чтобы выбрать")
         dz.setObjectName("hint")
         dz.setAlignment(Qt.AlignmentFlag.AlignCenter)
         dl.addWidget(dz)
         self.drop.mousePressEvent = lambda _e: self.choose_file()  # type: ignore
-        root.addWidget(self.drop)
+        top.addWidget(self.drop, 1)
+
+        root.addLayout(top)
+
+        self.fw_lbl = QLabel("")
+        self.fw_lbl.setObjectName("hint")
+        root.addWidget(self.fw_lbl)
 
         # file info
         fi = QHBoxLayout()
