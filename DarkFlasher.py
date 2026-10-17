@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Dark Flasher — запись .uf2 на nRF52 (nice!nano / Adafruit nRF52 UF2 bootloader).
@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 APP_NAME = "Dark Flasher"
-APP_VERSION = "1.0"
+APP_VERSION = "1.1"
 WINDOW_TITLE = "Dark Flasher — nRF52 UF2"
 
 DEST_NAME = "FW.UF2"          # короткое 8.3-имя: никаких сюрпризов с LFN
