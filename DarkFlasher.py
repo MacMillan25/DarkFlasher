@@ -1060,14 +1060,16 @@ class App:
     def _start_settings_send(self) -> None:
         if not self.settings.get("send_after_flash", True):
             return
-        cmds = cfg.build_commands(self.settings)
-        self.log("жду COM-порт ноды для отправки настроек…", "info")
+        # reboot последней: freq/bw/sf/cr/tx применяются только после старта.
+        cmds = cfg.build_commands(self.settings) + ["reboot"]
+        self.log("ищу ноду на COM-портах (спрашиваю версию)…", "info")
 
         def work() -> None:
-            port = cfg.wait_for_new_port(self._ports_before, timeout=15.0)
+            port = cfg.find_node_port(
+                timeout=20.0, log=lambda m: self.q.put(("log", m, "dim")))
             if not port:
-                self.q.put(("log", "COM-порт не появился за 15 с — "
-                                   "настройки НЕ отправлены", "err"))
+                self.q.put(("log", "нода не ответила на COM за 20 с — "
+                                   "настройки НЕ отправлены (проверь кабель)", "err"))
                 self.q.put(("settings_done", False))
                 return
             self.q.put(("log", f"порт {port}: отправляю настройки", "ok"))

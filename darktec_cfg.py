@@ -206,6 +206,33 @@ def wait_for_new_port(before: list[str], timeout: float = 15.0, poll: float = 0.
     return None
 
 
+def find_node_port(timeout: float = 20.0, log=print) -> str | None:
+    """Ищет ноду среди COM-портов, опрашивая её командой `ver`.
+
+    Номер порта после прошивки может остаться прежним, поэтому имя не
+    показатель: открываем порт, спрашиваем версию и верим ответу.
+    """
+    serial = _serial()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for port in list_ports():
+            try:
+                with serial.Serial(port, SERIAL_BAUD, timeout=0.2,
+                                   write_timeout=1) as ser:
+                    time.sleep(0.3)
+                    ser.reset_input_buffer()
+                    ser.write(b"ver\r\n")
+                    reply = _read_reply(ser, 1.0)
+            except Exception:
+                continue
+            if reply and ("dark" in reply.lower() or "v1." in reply.lower()
+                          or "ok" in reply.lower()):
+                log(f"нода отвечает на {port}: {reply}")
+                return port
+        time.sleep(1.0)
+    return None
+
+
 def _read_reply(ser, timeout: float = 2.0) -> str:
     ser.timeout = 0.2
     deadline = time.time() + timeout
@@ -223,7 +250,10 @@ def _read_reply(ser, timeout: float = 2.0) -> str:
 
 
 def send_commands(port: str, commands: list[str], log=print) -> bool:
-    """Отправляет CLI-команды по очереди, ждёт ответ на каждую."""
+    """Отправляет CLI-команды по очереди, ждёт ответ на каждую.
+
+    `reboot` идёт последней и ответа не ждёт: нода уходит в перезагрузку.
+    """
     serial = _serial()
     ok = True
     try:
@@ -233,8 +263,11 @@ def send_commands(port: str, commands: list[str], log=print) -> bool:
             for cmd in commands:
                 ser.write((cmd + "\r\n").encode("ascii", "replace"))
                 ser.flush()
-                reply = _read_reply(ser)
                 log(f"> {cmd}")
+                if cmd.strip() == "reboot":
+                    time.sleep(0.5)
+                    break
+                reply = _read_reply(ser)
                 if reply:
                     log(f"< {reply}")
                 low = reply.lower()
