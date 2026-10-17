@@ -622,22 +622,22 @@ class FlashJob(threading.Thread):
 # Оформление
 # --------------------------------------------------------------------------
 
-BG = "#0e1116"
-PANEL = "#151a22"
-PANEL2 = "#1b2230"
-BORDER = "#2a3242"
-BORDER_HOVER = "#3d4a61"
-TEXT = "#e6edf3"
-DIM = "#8b98a9"
-FAINT = "#5b6779"
-ACCENT = "#5ee0a0"
-ACCENT_DARK = "#2e6b52"
-WARN = "#f2b84b"
+BG = "#0b0e14"
+PANEL = "#111722"
+PANEL2 = "#161e2b"
+BORDER = "#222c3c"
+BORDER_HOVER = "#33415a"
+TEXT = "#e6ebf2"
+DIM = "#98a3b3"
+FAINT = "#5d6a7c"
+ACCENT = "#4ea583"
+ACCENT_DARK = "#235c47"
+WARN = "#d9a054"
 WARN_DARK = "#6b5426"
-ERR = "#ff6b6b"
+ERR = "#d96a6a"
 ERR_DARK = "#6e2f35"
 BLUE = "#6cb6ff"
-BLUE_DARK = "#2b4c6b"
+BLUE_DARK = "#1d3a5f"
 
 # ------------------------------- geometry ---------------------------------
 S = 1.0  # DPI scale, ставится в launch_gui()
@@ -757,8 +757,8 @@ class App:
         root.bind("<Escape>", lambda _e: self.on_close())
         root.bind("<Control-o>", lambda _e: self.choose_file())
 
-        self.W = X(760)
-        self.H = X(890)
+        self.W = X(780)
+        self.H = X(920)
         sw = root.winfo_screenwidth()
         sh = root.winfo_screenheight()
         x = max(0, (sw - self.W) // 2)
@@ -796,79 +796,100 @@ class App:
         root = self.root
 
         # header -----------------------------------------------------------
-        self.logo = tk.Canvas(root, width=X(34), height=X(34), bg=BG,
+        self.logo = tk.Canvas(root, width=X(32), height=X(32), bg=BG,
                               highlightthickness=0, bd=0)
-        self.logo.place(x=X(24), y=X(20))
-        self._draw_logo(self.logo, X(34), X(34))
+        self.logo.place(x=X(24), y=X(22))
+        self._draw_logo(self.logo, X(32), X(32))
 
         tk.Label(root, text=APP_NAME, bg=BG, fg=TEXT, font=self.f_title,
-                 anchor="w").place(x=X(70), y=X(17), width=X(300), height=X(24))
+                 anchor="w").place(x=X(68), y=X(18), width=X(320), height=X(24))
         tk.Label(root, text=f"nRF52 · UF2 · v{APP_VERSION}", bg=BG, fg=FAINT,
-                 font=self.f_sub, anchor="w").place(x=X(71), y=X(42),
-                                                    width=X(300), height=X(18))
+                 font=self.f_sub, anchor="w").place(x=X(69), y=X(43),
+                                                    width=X(320), height=X(18))
 
         self.badge = tk.Canvas(root, bg=BG, highlightthickness=0, bd=0,
-                               height=X(26))
-        self.badge.place(x=X(760 - 24 - 150), y=X(24), width=X(150), height=X(26))
+                               height=X(24))
+        self.badge.place(x=X(780 - 24 - 150), y=X(26), width=X(150), height=X(24))
 
-        # firmware row -----------------------------------------------------
-        tk.Label(root, text="ПРОШИВКА", bg=BG, fg=FAINT,
-                 font=self.f_badge).place(x=X(24), y=X(64))
+        # role + source ----------------------------------------------------
+        tk.Label(root, text="РОЛЬ", bg=BG, fg=FAINT,
+                 font=self.f_badge).place(x=X(24), y=X(68))
+
+        titles = [t for _s, t, _e in cfg.ROLES]
+        cur_role = self.settings.get("role", "companion_radio_ble")
+        self.role_slug = cur_role
+        cur_title = cfg.role_title(cur_role)
+        self.role_var = tk.StringVar(value=cur_title)
+        self.role_menu = tk.OptionMenu(root, self.role_var, *titles,
+                                       command=self.on_role_change)
+        self.role_menu.configure(bg=PANEL2, fg=TEXT, activebackground=BORDER,
+                                 activeforeground=TEXT, bd=0, relief="flat",
+                                 highlightthickness=0, font=self.f_meta,
+                                 anchor="w", padx=X(8))
+        self.role_menu["menu"].configure(bg=PANEL2, fg=TEXT,
+                                         activebackground=BORDER,
+                                         activeforeground=TEXT,
+                                         font=self.f_meta)
+        self.role_menu.place(x=X(24), y=X(84), width=X(318), height=X(27))
+
+        self._mk_btn(root, "Скачать с GitHub", self.download_online,
+                     X(354), X(84), X(196), X(27))
+        self._mk_btn(root, "Обновить", self.rescan_firmware,
+                     X(562), X(84), X(96), X(27))
+        self._mk_btn(root, "Выбрать…", self.choose_file,
+                     X(666), X(84), X(90), X(27))
+
         self.fw_lbl = tk.Label(root, text="", bg=BG, fg=DIM, font=self.f_meta,
                                anchor="w")
-        self.fw_lbl.place(x=X(24), y=X(82), width=X(536), height=X(18))
-        self._mk_btn(root, "Обновить", self.rescan_firmware,
-                     X(570), X(80), X(80), X(24))
-        self._mk_btn(root, "Выбрать…", self.choose_file,
-                     X(658), X(80), X(78), X(24))
+        self.fw_lbl.place(x=X(24), y=X(118), width=X(732), height=X(18))
 
         # drop zone --------------------------------------------------------
-        self.zone_w = X(760 - 48)
-        self.zone_h = X(104)
+        self.zone_w = X(780 - 48)
+        self.zone_h = X(84)
         self.zone = tk.Canvas(root, bg=BG, highlightthickness=0, bd=0,
                               width=self.zone_w, height=self.zone_h,
                               cursor="hand2")
-        self.zone.place(x=X(24), y=X(112), width=self.zone_w,
+        self.zone.place(x=X(24), y=X(146), width=self.zone_w,
                         height=self.zone_h)
         self.zone.bind("<Button-1>", lambda _e: self.choose_file())
         self.zone.bind("<Enter>", self._on_zone_enter)
         self.zone.bind("<Leave>", self._on_zone_leave)
 
-        # file + meta + progress ------------------------------------------
+        # file + progress --------------------------------------------------
         self.name_lbl = tk.Label(root, text="файл не выбран", bg=BG, fg=FAINT,
                                  font=self.f_meta, anchor="w")
-        self.name_lbl.place(x=X(24), y=X(224), width=X(500), height=X(18))
+        self.name_lbl.place(x=X(24), y=X(240), width=X(520), height=X(18))
         self.meta_lbl = tk.Label(root, text="", bg=BG, fg=FAINT,
                                  font=self.f_meta, anchor="e")
-        self.meta_lbl.place(x=X(530), y=X(224), width=X(206), height=X(18))
+        self.meta_lbl.place(x=X(550), y=X(240), width=X(206), height=X(18))
 
         self.bar = tk.Canvas(root, bg=BG, highlightthickness=0, bd=0,
                              height=X(6))
-        self.bar.place(x=X(24), y=X(248), width=self.zone_w, height=X(6))
+        self.bar.place(x=X(24), y=X(264), width=self.zone_w, height=X(6))
 
         self.status_lbl = tk.Label(root, text="", bg=BG, fg=DIM,
                                    font=self.f_status, anchor="w")
-        self.status_lbl.place(x=X(24), y=X(260), width=X(620), height=X(18))
+        self.status_lbl.place(x=X(24), y=X(276), width=X(640), height=X(18))
         self.pct_lbl = tk.Label(root, text="", bg=BG, fg=DIM,
                                 font=self.f_status, anchor="e")
-        self.pct_lbl.place(x=X(650), y=X(260), width=X(86), height=X(18))
+        self.pct_lbl.place(x=X(672), y=X(276), width=X(84), height=X(18))
 
         # settings ---------------------------------------------------------
         tk.Frame(root, bg=BORDER, height=X(1), bd=0).place(
-            x=X(24), y=X(288), width=self.zone_w, height=X(1))
+            x=X(24), y=X(304), width=self.zone_w, height=X(1))
         tk.Label(root, text="НАСТРОЙКИ НОДЫ", bg=BG, fg=FAINT,
-                 font=self.f_badge).place(x=X(24), y=X(296))
+                 font=self.f_badge).place(x=X(24), y=X(312))
 
         self.vars: dict[str, object] = {}
-        self._field(root, "Имя ноды", "name", 0, 0, "пусто — не менять", 170)
-        self._field(root, "Частота, МГц", "freq", 0, 1, "", 170)
-        self._field(root, "Полоса, кГц", "bw", 0, 2, "", 170)
-        self._field(root, "SF", "sf", 0, 3, "5..12", 170)
-        self._field(root, "CR", "cr", 0, 4, "5..8", 170)
-        self._field(root, "Мощность, dBm", "tx", 1, 0, "-9..22", 120)
-        self._field(root, "Ёмкость, мАч", "capacity", 1, 1, "1000..10000", 120)
+        self._field(root, "Имя ноды", "name", 0, 0, "пусто — не менять", 160)
+        self._field(root, "Частота, МГц", "freq", 0, 1, "", 160)
+        self._field(root, "Полоса, кГц", "bw", 0, 2, "", 160)
+        self._field(root, "SF", "sf", 0, 3, "5..12", 160)
+        self._field(root, "CR", "cr", 0, 4, "5..8", 160)
+        self._field(root, "Мощность, dBm", "tx", 1, 0, "-9..22", 110)
+        self._field(root, "Ёмкость, мАч", "capacity", 1, 1, "1000..10000", 110)
         self._module_field(root, 1, 2)
-        self._field(root, "Коэф. АЦП", "adc", 1, 3, "1.750", 120)
+        self._field(root, "Коэф. АЦП", "adc", 1, 3, "1.750", 110)
 
         self.send_var = tk.BooleanVar(
             value=bool(self.settings.get("send_after_flash", True)))
@@ -877,25 +898,25 @@ class App:
                        bg=BG, fg=DIM, activebackground=BG,
                        activeforeground=TEXT, selectcolor=PANEL2,
                        font=self.f_meta, anchor="w").place(
-            x=X(390), y=X(452), width=X(346), height=X(24))
+            x=X(400), y=X(456), width=X(346), height=X(24))
 
         self._mk_btn(root, "ПРОШИТЬ", self.flash_current,
-                     X(24), X(490), X(340), X(36), ACCENT_DARK, TEXT)
+                     X(24), X(494), X(348), X(34), ACCENT_DARK, TEXT)
         self._mk_btn(root, "Отправить настройки", self.send_settings_now,
-                     X(376), X(490), X(360), X(36), PANEL2, TEXT)
+                     X(384), X(494), X(372), X(34))
 
         # divider + log ----------------------------------------------------
         tk.Frame(root, bg=BORDER, height=X(1), bd=0).place(
-            x=X(24), y=X(540), width=self.zone_w, height=X(1))
+            x=X(24), y=X(546), width=self.zone_w, height=X(1))
         tk.Label(root, text="ЛОГ", bg=BG, fg=FAINT,
-                 font=self.f_badge).place(x=X(24), y=X(548))
+                 font=self.f_badge).place(x=X(24), y=X(554))
 
         self.logw = tk.Text(root, bg=PANEL, fg=DIM, bd=0, relief="flat",
                             highlightthickness=0, wrap="word",
                             font=self.f_log, padx=X(10), pady=X(8),
                             insertbackground=TEXT, selectbackground=BLUE_DARK,
                             cursor="arrow", spacing1=X(1), spacing3=X(1))
-        self.logw.place(x=X(24), y=X(562), width=self.zone_w, height=X(300))
+        self.logw.place(x=X(24), y=X(568), width=self.zone_w, height=X(316))
         self.logw.tag_configure("time", foreground=FAINT)
         self.logw.tag_configure("dim", foreground=FAINT)
         self.logw.tag_configure("info", foreground=DIM)
@@ -922,8 +943,8 @@ class App:
 
     def _field(self, parent, label, key, col, row, hint, width):
         tk = self.tk
-        base_x = 24 if col == 0 else 390
-        y = 320 + row * 34
+        base_x = 24 if col == 0 else 400
+        y = 338 + row * 34
         tk.Label(parent, text=label, bg=BG, fg=DIM, font=self.f_meta,
                  anchor="w").place(x=X(base_x), y=X(y), width=X(146),
                                    height=X(20))
@@ -936,14 +957,14 @@ class App:
         if hint:
             tk.Label(parent, text=hint, bg=BG, fg=FAINT, font=self.f_meta,
                      anchor="w").place(x=X(base_x + 150 + width + 6), y=X(y),
-                                       width=X(80), height=X(20))
+                                       width=X(84), height=X(20))
         v.trace_add("write", lambda *_a: self._on_setting_changed())
         self.vars[key] = v
 
     def _module_field(self, parent, col, row):
         tk = self.tk
-        base_x = 390
-        y = 320 + row * 34
+        base_x = 400
+        y = 338 + row * 34
         tk.Label(parent, text="Модуль", bg=BG, fg=DIM, font=self.f_meta,
                  anchor="w").place(x=X(base_x), y=X(y), width=X(146),
                                    height=X(20))
@@ -987,34 +1008,40 @@ class App:
         self.settings["send_after_flash"] = bool(self.send_var.get())
         cfg.save_settings(self.settings)
 
-    def rescan_firmware(self) -> None:
-        found = cfg.scan_firmware()
-        self.firmware = found
-        if not found:
-            dirs = ", ".join(cfg.firmware_dirs())
-            self.fw_lbl.configure(
-                text=f"папка firmware пуста — положи .uf2 в {dirs}", fg=WARN)
-            self.current_file = None
-            return
-        env = self.settings.get("last_env")
-        if env not in found:
-            env = next(iter(found))
-        self._select_env(env)
+    def on_role_change(self, title: str) -> None:
+        for slug, t, _env in cfg.ROLES:
+            if t == title:
+                self.role_slug = slug
+                self.settings["role"] = slug
+                cfg.save_settings(self.settings)
+                break
+        self.rescan_firmware()
 
-    def _select_env(self, env: str) -> None:
+    def _env(self) -> str:
+        return cfg.ROLE_ENVS.get(self.role_slug, "")
+
+    def rescan_firmware(self) -> None:
+        self.firmware = cfg.scan_firmware()
+        env = self._env()
         path = self.firmware.get(env)
-        if not path:
-            self.fw_lbl.configure(text="прошивка не найдена", fg=WARN)
-            self.current_file = None
+        if path:
+            self._apply_file(path)
             return
+        self.current_file = None
+        self.fw_lbl.configure(
+            text=f"нет файла для роли «{cfg.role_title(self.role_slug)}» — "
+                 f"положи .uf2 в firmware или нажми «Скачать с GitHub»",
+            fg=WARN)
+
+    def _apply_file(self, path: str) -> None:
+        env = cfg.role_env_from_filename(os.path.basename(path)) or self._env()
         self.current_file = path
         self.current_env = env
-        role = cfg.role_for_env(env)
-        title = cfg.role_title(role) if role else "неизвестная роль"
-        self.fw_lbl.configure(
-            text=f"{title} · {os.path.basename(path)}", fg=ACCENT)
         self.settings["last_env"] = env
         cfg.save_settings(self.settings)
+        title = cfg.role_title(cfg.role_for_env(env) or "")
+        self.fw_lbl.configure(text=f"{title} · {os.path.basename(path)}",
+                              fg=ACCENT)
         try:
             info = Uf2Info.load(path)
         except (OSError, Uf2Error) as e:
@@ -1022,12 +1049,11 @@ class App:
             return
         self.info = info
         self.file_path = path
-        self.name_lbl.configure(text=elide(os.path.basename(path), self.f_name,
-                                           X(490)),
+        self.name_lbl.configure(text=elide(os.path.basename(path),
+                                           self.f_name, X(505)),
                                 fg=TEXT, font=self.f_name)
         self.meta_lbl.configure(
-            text=f"{fmt_size(info.size)} · {info.num_blocks} бл.",
-            fg=FAINT)
+            text=f"{fmt_size(info.size)} · {info.num_blocks} бл.", fg=FAINT)
 
     def choose_file(self) -> None:
         if self.busy:
@@ -1036,14 +1062,37 @@ class App:
             parent=self.root, title="Выбери прошивку .uf2",
             filetypes=[("UF2 firmware", "*.uf2"), ("Все файлы", "*.*")])
         if path:
-            env = cfg.role_env_from_filename(os.path.basename(path))
-            if env:
-                self.firmware = getattr(self, "firmware", {})
-                self.firmware[env] = path
-                self._select_env(env)
-            else:
-                self.log("по имени файла роль не понял — переименуй "
-                         "в Darktec_<роль>.uf2", "warn")
+            self._apply_file(path)
+
+    def download_online(self) -> None:
+        if self.busy:
+            return
+        env = self._env()
+        if not env:
+            return
+        self.log("читаю манифест с GitHub…", "info")
+
+        def work() -> None:
+            try:
+                man = cfg.fetch_manifest()
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("log", f"манифест недоступен: {e}", "err"))
+                return
+            files = man.get("files") if isinstance(man.get("files"), dict) else {}
+            url = files.get(env)
+            ver = man.get("version", "?")
+            if not url:
+                self.q.put(("log", f"в манифесте v{ver} нет файла для этой роли",
+                            "err"))
+                return
+            self.q.put(("log", f"манифест v{ver}: качаю {os.path.basename(url)}",
+                        "info"))
+            path = cfg.download_firmware(
+                env, url, log=lambda m: self.q.put(("log", m, "dim")))
+            if path:
+                self.q.put(("online_ready", path))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def on_drop(self, paths: list[str]) -> None:
         now = time.monotonic()
@@ -1058,21 +1107,9 @@ class App:
         if not uf2:
             self._fail("Нужен файл .uf2")
             return
-        env = cfg.role_env_from_filename(os.path.basename(uf2))
-        if env:
-            self.firmware = getattr(self, "firmware", {})
-            self.firmware[env] = uf2
-            self._select_env(env)
-        if self.info is None or self.file_path != uf2:
-            try:
-                self.info = Uf2Info.load(uf2)
-            except (OSError, Uf2Error) as e:
-                self._fail(str(e))
-                return
-            self.file_path = uf2
-            self.name_lbl.configure(text=elide(os.path.basename(uf2),
-                                               self.f_name, X(490)),
-                                    fg=TEXT, font=self.f_name)
+        self._apply_file(uf2)
+        if self.info is None:
+            return
         if self.info.family != UF2_FAMILY_NRF52840:
             self._fail(f"это UF2 для {family_name(self.info.family)}, "
                        f"а нужен nRF52840")
@@ -1080,8 +1117,6 @@ class App:
         self.progress = 0.0
         self.pct_lbl.configure(text="0%")
         self.log(f"файл: {os.path.basename(uf2)}", "info")
-        self.log(f"{fmt_size(self.info.size)} · {self.info.num_blocks} блоков · "
-                 f"{family_name(self.info.family)}", "info")
         self._draw_progress()
         if len(self.vols) == 1:
             self.start_flash(self.vols[0])
@@ -1094,37 +1129,50 @@ class App:
         if not getattr(self, "current_file", None):
             self.rescan_firmware()
         if not getattr(self, "current_file", None):
-            self.log("нет прошивки: положи .uf2 в папку firmware", "err")
+            self.log("нет прошивки для этой роли", "err")
             return
-        role = cfg.role_for_env(self.current_env) or self.current_env or "?"
-        self.log(f"прошиваю роль: {cfg.role_title(role)}", "ok")
+        self.log(f"прошиваю: {cfg.role_title(self.role_slug)}", "ok")
         self.on_drop([self.current_file])
 
-    # ------------------------------------------------------------- COM/настройки
+    # ------------------------------------------------------------- COM
+    def _wait_nrf_port(self, timeout: float = 15.0) -> str | None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            ports = cfg.nrf_ports()
+            if ports:
+                return ports[0]
+            time.sleep(0.5)
+        return None
+
+    def _send_settings_thread(self, port: str, prefix: str) -> None:
+        cmds = cfg.build_commands(self.settings)
+        total = len(cmds)
+
+        def progress(p: float) -> None:
+            self.q.put(("settings_progress", prefix + (1.0 - prefix) * p))
+
+        ok = cfg.send_commands_batch(
+            port, cmds, progress=progress,
+            log=lambda m: self.q.put(("log", m, "dim")))
+        self.q.put(("settings_done", ok))
+
     def _start_settings_send(self) -> None:
         if not self.settings.get("send_after_flash", True):
             return
+        self._set_progress(0.74)
+        self._status("ищу ноду — НЕ ОТКЛЮЧАЙ плату")
         self.log("ищу ноду среди портов nRF (VID 239A/1915)…", "info")
 
         def work() -> None:
-            port = None
-            deadline = time.time() + 15.0
-            while time.time() < deadline:
-                ports = cfg.nrf_ports()
-                if ports:
-                    port = ports[0]
-                    break
-                time.sleep(0.5)
+            port = self._wait_nrf_port(15.0)
             if not port:
                 self.q.put(("log", "нода не появилась — настройки НЕ отправлены. "
                                    "Проверь кабель и нажми «Отправить настройки»", "err"))
                 self.q.put(("settings_done", False))
                 return
-            self.q.put(("log", f"порт {port}: отправляю настройки", "ok"))
-            cmds = cfg.build_commands(self.settings) + ["reboot"]
-            ok = cfg.send_commands(port, cmds,
-                                   log=lambda m: self.q.put(("log", m, "dim")))
-            self.q.put(("settings_done", ok))
+            self.q.put(("log", f"порт {port}: отправляю настройки пачкой", "ok"))
+            self.q.put(("settings_progress", 0.78))
+            self._send_settings_thread(port, 0.78)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1139,15 +1187,10 @@ class App:
         port = ports[0]
         self.settings = self._collect_settings()
         cfg.save_settings(self.settings)
-        cmds = cfg.build_commands(self.settings) + ["reboot"]
         self.log(f"отправляю настройки на {port}", "info")
-
-        def work() -> None:
-            ok = cfg.send_commands(port, cmds,
-                                   log=lambda m: self.q.put(("log", m, "dim")))
-            self.q.put(("settings_done", ok))
-
-        threading.Thread(target=work, daemon=True).start()
+        self._set_progress(0.05)
+        threading.Thread(target=self._send_settings_thread,
+                         args=(port, 0.05), daemon=True).start()
 
 
     def _draw_logo(self, c, w: int, h: int) -> None:
@@ -1548,11 +1591,18 @@ class App:
                     self._status(event[1])
                 elif kind == "log":
                     self.log(event[1], event[2])
+                elif kind == "online_ready":
+                    self.log("прошивка скачана", "ok")
+                    self._apply_file(event[1])
+                elif kind == "settings_progress":
+                    self._set_progress(event[1])
                 elif kind == "settings_done":
                     if event[1]:
+                        self._set_progress(1.0)
                         self.log("настройки записаны в ноду", "ok")
-                        self._status("прошивка и настройки готовы")
+                        self._status("готово: прошивка и настройки на месте")
                     else:
+                        self._status("прошивка записана, настройки — не полностью")
                         self.log("настройки записаны не полностью — "
                                  "проверь лог", "warn")
         except queue.Empty:
@@ -1580,7 +1630,8 @@ class App:
     def on_progress(self, done: int, total: int) -> None:
         if total <= 0:
             return
-        self._set_progress(done / total)
+        # Запись — первая часть общего прогресса (остальное: порт и настройки).
+        self._set_progress((done / total) * 0.72)
         self._status(f"пишу {fmt_size(done)} из {fmt_size(total)}")
 
     def on_flash(self, res: FlashResult) -> None:

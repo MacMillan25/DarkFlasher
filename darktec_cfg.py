@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import time
+import urllib.request
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_NAME = "darkflasher.json"
@@ -43,6 +44,7 @@ MODULES = [
 ]
 
 DEFAULT_SETTINGS = {
+    "role": "companion_radio_ble",
     "name": "",
     "freq": 869.900,
     "bw": 62.5,
@@ -275,3 +277,92 @@ def build_commands(s: dict) -> list[str]:
     cmds.append(f"set radio.module {int(s.get('module', 0))}")
     cmds.append(f"set darktec.capacity {int(s.get('capacity', 3000))}")
     return cmds
+
+
+# ------------------------------------------------------------ онлайн-прошивки
+
+# Манифест лежит в репозитории DarkFlasher: рядом с exe или в main на GitHub.
+# Формат: {"version": "1.1", "files": {"<env>": "<url>"}}
+MANIFEST_URL = ("https://raw.githubusercontent.com/MacMillan25/DarkFlasher/"
+                "main/firmware/manifest.json")
+
+
+def fetch_manifest(url: str = MANIFEST_URL, timeout: float = 15.0) -> dict:
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        data = json.load(r)
+    return data if isinstance(data, dict) else {}
+
+
+def download_firmware(env: str, url: str, log=print) -> str | None:
+    """Скачивает .uf2 в папку firmware. Возвращает путь или None."""
+    os.makedirs(firmware_dirs()[0], exist_ok=True)
+    dest = os.path.join(firmware_dirs()[0], env + ".uf2")
+    tmp = dest + ".part"
+    log(f"скачиваю {env}…")
+    try:
+        with urllib.request.urlopen(url, timeout=90) as r, open(tmp, "wb") as f:
+            while True:
+                chunk = r.read(64 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+    except Exception as e:  # noqa: BLE001
+        log(f"не скачалось: {e}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return None
+    if not _looks_like_uf2(tmp):
+        log("скачанный файл не похож на UF2")
+        os.remove(tmp)
+        return None
+    os.replace(tmp, dest)
+    return dest
+
+
+def send_commands_batch(port: str, commands: list[str], log=print,
+                        progress=None) -> bool:
+    """Отправляет все команды одной посылкой, затем reboot.
+
+    Быстрее, чем по одной: нода разбирает входной буфер построчно, ответы
+    приходят пачкой. `progress(0..1)` — для единого индикатора записи.
+    """
+    ok = True
+    try:
+        ser = open_serial(port)
+    except Exception as e:  # noqa: BLE001
+        log(f"COM {port}: {e}")
+        return False
+    try:
+        time.sleep(0.4)
+        ser.reset_input_buffer()
+        payload = "".join(c + "\r\n" for c in commands)
+        ser.write(payload.encode("ascii", "replace"))
+        ser.flush()
+        log(f"> {len(commands)} команд одной посылкой")
+        if progress:
+            progress(0.6)
+        time.sleep(1.2)
+        reply = _read_reply(ser, 2.0)
+        if progress:
+            progress(1.0)
+        for line in reply.splitlines():
+            log(f"< {line}")
+        low = reply.lower()
+        if "error" in low or "unknown" in low:
+            ok = False
+            log("часть команд отклонена — смотри ответы выше")
+        # Перезагрузка: применяет freq/bw/sf/cr/tx.
+        ser.write(b"reboot\r\n")
+        ser.flush()
+        time.sleep(0.3)
+    except Exception as e:  # noqa: BLE001
+        log(f"COM {port}: {e}")
+        return False
+    finally:
+        try:
+            ser.close()
+        except Exception:
+            pass
+    return ok

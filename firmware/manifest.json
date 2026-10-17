@@ -1,0 +1,13 @@
+{
+  "version": "1.1",
+  "files": {
+    "Darktec_companion_radio_ble": "https://github.com/MacMillan25/DarkFlasher/releases/download/v1.1/Darktec_companion_radio_ble.uf2",
+    "Darktec_companion_radio_usb": "https://github.com/MacMillan25/DarkFlasher/releases/download/v1.1/Darktec_companion_radio_usb.uf2",
+    "Darktec_kiss_modem": "https://github.com/MacMillan25/DarkFlasher/releases/download/v1.1/Darktec_kiss_modem.uf2",
+    "Darktec_repeater": "https://github.com/MacMillan25/DarkFlasher/releases/download/v1.1/Darktec_repeater.uf2",
+    "Darktec_repeater_bridge_rs232_serial1": "https://github.com/MacMillan25/DarkFlasher/releases/download/v1.1/Darktec_repeater_bridge_rs232_serial1.uf2",
+    "Darktec_room_server": "https://github.com/MacMillan25/DarkFlasher/releases/download/v1.1/Darktec_room_server.uf2",
+    "Darktec_sensor": "https://github.com/MacMillan25/DarkFlasher/releases/download/v1.1/Darktec_sensor.uf2",
+    "Darktec_terminal_chat": "https://github.com/MacMillan25/DarkFlasher/releases/download/v1.1/Darktec_terminal_chat.uf2"
+  }
+}
