@@ -282,3 +282,172 @@ def build_commands(s: dict) -> list[str]:
     cmds.append(f"set radio.module {int(s.get('module', 0))}")
     cmds.append(f"set darktec.capacity {int(s.get('capacity', 3000))}")
     return cmds
+
+
+# ------------------------------------------------------------ онлайн-прошивки
+
+# Манифест лежит в репозитории DarkFlasher: рядом с exe или в main на GitHub.
+MANIFEST_URL = ("https://raw.githubusercontent.com/MacMillan25/DarkFlasher/"
+                "main/firmware/manifest.json")
+
+# Релизы прошивки: теги вида darktec-*, ассеты — <env>.uf2.
+RELEASES_API = ("https://api.github.com/repos/MacMillan25/MeshCore/"
+                "releases?per_page=30")
+
+
+def list_firmware_releases(timeout: float = 15.0) -> list[dict]:
+    """Список релизов прошивки: tag, name, date, files{env: url}."""
+    req = urllib.request.Request(RELEASES_API, headers={
+        "User-Agent": "DarkFlasher",
+        "Accept": "application/vnd.github+json",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = json.load(r)
+    out: list[dict] = []
+    for rel in data if isinstance(data, list) else []:
+        tag = rel.get("tag_name", "")
+        if not tag.startswith("darktec-"):
+            continue
+        files = {}
+        for a in rel.get("assets", []):
+            name = a.get("name", "")
+            if name.lower().endswith(".uf2"):
+                files[name[:-4]] = a.get("browser_download_url", "")
+        out.append({
+            "tag": tag,
+            "name": rel.get("name") or tag,
+            "date": (rel.get("published_at") or "")[:10],
+            "files": files,
+        })
+    return out
+
+
+def fetch_manifest(url: str = MANIFEST_URL, timeout: float = 15.0) -> dict:
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        data = json.load(r)
+    return data if isinstance(data, dict) else {}
+
+
+def download_firmware(env: str, url: str, log=print) -> str | None:
+    """Скачивает .uf2 в папку firmware. Возвращает путь или None."""
+    os.makedirs(firmware_dirs()[0], exist_ok=True)
+    dest = os.path.join(firmware_dirs()[0], env + ".uf2")
+    tmp = dest + ".part"
+    log(f"скачиваю {env}…")
+    try:
+        with urllib.request.urlopen(url, timeout=180) as r, open(tmp, "wb") as f:
+            while True:
+                chunk = r.read(64 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+    except Exception as e:  # noqa: BLE001
+        log(f"не скачалось: {e}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return None
+    if not _looks_like_uf2(tmp):
+        log("скачанный файл не похож на UF2")
+        os.remove(tmp)
+        return None
+    os.replace(tmp, dest)
+    return dest
+
+
+# ------------------------------------------------------------- CLI по USB
+
+def read_version(port: str, timeout: float = 2.5) -> str:
+    """Спрашивает у ноды версию прошивки (CLI `ver`)."""
+    try:
+        ser = open_serial(port)
+    except Exception:
+        return ""
+    try:
+        ser.reset_input_buffer()
+        payload = bytes([CMD_RUN_CLI]) + b"ver"
+        ser.write(b"<" + bytes([len(payload) & 0xFF,
+                                (len(payload) >> 8) & 0xFF]) + payload)
+        ser.flush()
+        return _read_cli_reply(ser, timeout)
+    except Exception:
+        return ""
+    finally:
+        try:
+            ser.close()
+        except Exception:
+            pass
+
+
+def _read_cli_reply(ser, timeout: float = 3.5) -> str:
+    """Читает кадр `>` + len + payload и возвращает текст CLI-ответа."""
+    deadline = time.time() + timeout
+    buf = b""
+    while time.time() < deadline:
+        try:
+            chunk = ser.read(256)
+        except Exception:
+            break
+        if chunk:
+            buf += chunk
+            while b">" in buf:
+                i = buf.index(b">")
+                if len(buf) < i + 3:
+                    break
+                ln = buf[i + 1] | (buf[i + 2] << 8)
+                if len(buf) < i + 3 + ln:
+                    break
+                payload = buf[i + 3:i + 3 + ln]
+                buf = buf[i + 3 + ln:]
+                if payload and payload[0] == RESP_CLI_REPLY:
+                    return payload[1:].decode("utf-8", "replace").strip()
+    return ""
+
+
+def send_commands_batch(port: str, commands: list[str], log=print,
+                        progress=None) -> bool:
+    """Шлёт CLI-команды кадрами бинарного протокола компаньона."""
+    ok = True
+    try:
+        ser = open_serial(port)
+    except Exception as e:  # noqa: BLE001
+        log(f"COM {port}: {e}")
+        return False
+    try:
+        time.sleep(0.3)
+        ser.reset_input_buffer()
+        n = len(commands)
+        for idx, cmd in enumerate(commands):
+            payload = bytes([CMD_RUN_CLI]) + cmd.encode("ascii", "replace")
+            ser.write(b"<" + bytes([len(payload) & 0xFF,
+                                    (len(payload) >> 8) & 0xFF]) + payload)
+            ser.flush()
+            log(f"> {cmd}")
+            if progress:
+                progress(0.3 + 0.5 * (idx + 1) / max(1, n))
+            reply = _read_cli_reply(ser, timeout=3.5)
+            if reply:
+                log(f"< {reply}")
+                low = reply.lower()
+                if "error" in low or "unknown" in low:
+                    ok = False
+                    log(f"команда не принята: {cmd}")
+            else:
+                log(f"< (нет ответа на {cmd})")
+        if progress:
+            progress(1.0)
+        payload = bytes([CMD_RUN_CLI]) + b"reboot"
+        ser.write(b"<" + bytes([len(payload) & 0xFF,
+                                (len(payload) >> 8) & 0xFF]) + payload)
+        ser.flush()
+        time.sleep(0.3)
+    except Exception as e:  # noqa: BLE001
+        log(f"COM {port}: {e}")
+        return False
+    finally:
+        try:
+            ser.close()
+        except Exception:
+            pass
+    return ok
