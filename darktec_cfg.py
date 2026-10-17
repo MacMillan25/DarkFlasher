@@ -396,8 +396,11 @@ def download_firmware(env: str, url: str, sha256: str = "",
 
 # ------------------------------------------------------------- CLI по USB
 
-def read_version(port: str, timeout: float = 2.5) -> str:
+def read_version(port: str, protocol: str = "frames",
+                 timeout: float = 2.5) -> str:
     """Спрашивает у ноды версию прошивки (CLI `ver`)."""
+    if protocol == "text":
+        return _text_cmd(port, "ver", timeout)
     try:
         ser = open_serial(port)
     except Exception:
@@ -416,6 +419,41 @@ def read_version(port: str, timeout: float = 2.5) -> str:
             ser.close()
         except Exception:
             pass
+
+
+def _text_cmd(port: str, cmd: str, timeout: float = 2.5) -> str:
+    try:
+        ser = open_serial(port)
+    except Exception:
+        return ""
+    try:
+        ser.reset_input_buffer()
+        ser.write((cmd + "\r\n").encode("ascii", "replace"))
+        ser.flush()
+        return _read_line(ser, timeout)
+    except Exception:
+        return ""
+    finally:
+        try:
+            ser.close()
+        except Exception:
+            pass
+
+
+def _read_line(ser, timeout: float = 2.5) -> str:
+    ser.timeout = 0.2
+    deadline = time.time() + timeout
+    buf = b""
+    while time.time() < deadline:
+        try:
+            chunk = ser.read(256)
+        except Exception:
+            break
+        if chunk:
+            buf += chunk
+            if b"\n" in buf:
+                break
+    return buf.decode("utf-8", "replace").strip()
 
 
 def _read_cli_reply(ser, timeout: float = 3.5) -> str:
@@ -443,9 +481,12 @@ def _read_cli_reply(ser, timeout: float = 3.5) -> str:
     return ""
 
 
-def send_commands_batch(port: str, commands: list[str], log=print,
-                        progress=None) -> bool:
-    """Шлёт CLI-команды кадрами бинарного протокола компаньона."""
+def send_commands_batch(port: str, commands: list[str], protocol: str = "frames",
+                        log=print, progress=None) -> bool:
+    """Шлёт CLI-команды. Компаньон — кадрами, остальные роли — текстом."""
+    if protocol == "text":
+        return _send_text(port, commands, log, progress)
+
     ok = True
     try:
         ser = open_serial(port)
@@ -478,6 +519,50 @@ def send_commands_batch(port: str, commands: list[str], log=print,
         payload = bytes([CMD_RUN_CLI]) + b"reboot"
         ser.write(b"<" + bytes([len(payload) & 0xFF,
                                 (len(payload) >> 8) & 0xFF]) + payload)
+        ser.flush()
+        time.sleep(0.3)
+    except Exception as e:  # noqa: BLE001
+        log(f"COM {port}: {e}")
+        return False
+    finally:
+        try:
+            ser.close()
+        except Exception:
+            pass
+    return ok
+
+
+def _send_text(port: str, commands: list[str], log=print,
+               progress=None) -> bool:
+    """Текстовый CLI (репитер, комната, сенсор, мост)."""
+    ok = True
+    try:
+        ser = open_serial(port)
+    except Exception as e:  # noqa: BLE001
+        log(f"COM {port}: {e}")
+        return False
+    try:
+        time.sleep(0.3)
+        ser.reset_input_buffer()
+        n = len(commands)
+        for idx, cmd in enumerate(commands):
+            ser.write((cmd + "\r\n").encode("ascii", "replace"))
+            ser.flush()
+            log(f"> {cmd}")
+            if progress:
+                progress(0.3 + 0.5 * (idx + 1) / max(1, n))
+            reply = _read_line(ser, 3.0)
+            if reply:
+                log(f"< {reply}")
+                low = reply.lower()
+                if "error" in low or "unknown" in low:
+                    ok = False
+                    log(f"команда не принята: {cmd}")
+            else:
+                log(f"< (нет ответа на {cmd})")
+        if progress:
+            progress(1.0)
+        ser.write(b"reboot\r\n")
         ser.flush()
         time.sleep(0.3)
     except Exception as e:  # noqa: BLE001

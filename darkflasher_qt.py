@@ -629,7 +629,10 @@ class MainWindow(QMainWindow):
         return None
 
     def _send_thread(self, port: str, prefix: float) -> None:
-        ver = cfg.read_version(port)
+        proto = ("frames" if self.role_slug in ("companion_radio_ble",
+                                              "companion_radio_usb")
+                 else "text")
+        ver = cfg.read_version(port, protocol=proto)
         if ver:
             self.q.put(("log", f"нода: {ver}", "info"))
             if "1.18.0d" not in ver:
@@ -640,7 +643,8 @@ class MainWindow(QMainWindow):
             self.q.put(("settings_progress", prefix + (1.0 - prefix) * p))
 
         ok = cfg.send_commands_batch(
-            port, cfg.build_commands(self.settings), progress=progress,
+            port, cfg.build_commands(self.settings), protocol=proto,
+            progress=progress,
             log=lambda m: self.q.put(("log", m, "dim")))
         self.q.put(("settings_done", ok))
 
