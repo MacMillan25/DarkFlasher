@@ -410,7 +410,7 @@ def find_meshcore_port(protocol: str = "frames",
             if port in checked:
                 continue
             checked.append(port)
-            ver = read_version(port, protocol=protocol, dtr=False)
+            ver = read_version(port, protocol=protocol, dtr=True)
             if ver and ("v1." in ver or "repeater" in ver.lower()
                         or "id:" in ver.lower() or "ok" in ver.lower()):
                 return port
