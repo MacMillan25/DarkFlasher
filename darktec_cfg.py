@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -296,7 +297,7 @@ RELEASES_API = ("https://api.github.com/repos/MacMillan25/MeshCore/"
 
 
 def list_firmware_releases(timeout: float = 15.0) -> list[dict]:
-    """Список релизов прошивки: tag, name, date, files{env: url}."""
+    """Список релизов прошивки: tag, name, date, files{env: {url, sha256}}."""
     req = urllib.request.Request(RELEASES_API, headers={
         "User-Agent": "DarkFlasher",
         "Accept": "application/vnd.github+json",
@@ -311,8 +312,14 @@ def list_firmware_releases(timeout: float = 15.0) -> list[dict]:
         files = {}
         for a in rel.get("assets", []):
             name = a.get("name", "")
-            if name.lower().endswith(".uf2"):
-                files[name[:-4]] = a.get("browser_download_url", "")
+            if not name.lower().endswith(".uf2"):
+                continue
+            digest = a.get("digest") or ""
+            files[name[:-4]] = {
+                "url": a.get("browser_download_url", ""),
+                "sha256": digest[7:] if digest.startswith("sha256:") else "",
+                "size": a.get("size", 0),
+            }
         out.append({
             "tag": tag,
             "name": rel.get("name") or tag,
@@ -328,21 +335,51 @@ def fetch_manifest(url: str = MANIFEST_URL, timeout: float = 15.0) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def download_firmware(env: str, url: str, log=print) -> str | None:
-    """Скачивает .uf2 в папку firmware. Возвращает путь или None."""
+def file_sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(256 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def download_firmware(env: str, url: str, sha256: str = "",
+                      progress=None, log=print) -> str | None:
+    """Скачивает .uf2 в firmware, считает скорость и сверяет sha256.
+
+    progress(done, total, bytes_per_sec) — для статуса «скачивание, N МБ/с».
+    """
     os.makedirs(firmware_dirs()[0], exist_ok=True)
     dest = os.path.join(firmware_dirs()[0], env + ".uf2")
     tmp = dest + ".part"
     log(f"скачиваю {env}…")
+    h = hashlib.sha256()
+    done = 0
+    started = time.time()
     try:
         with urllib.request.urlopen(url, timeout=180) as r, open(tmp, "wb") as f:
+            total = int(r.headers.get("Content-Length") or 0)
             while True:
                 chunk = r.read(64 * 1024)
                 if not chunk:
                     break
                 f.write(chunk)
+                h.update(chunk)
+                done += len(chunk)
+                if progress:
+                    speed = done / max(0.001, time.time() - started)
+                    progress(done, total, speed)
     except Exception as e:  # noqa: BLE001
         log(f"не скачалось: {e}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return None
+
+    got = h.hexdigest()
+    if sha256 and got.lower() != sha256.lower():
+        log(f"хэш не совпал: ждали {sha256[:12]}…, получили {got[:12]}…")
         try:
             os.remove(tmp)
         except OSError:
@@ -353,6 +390,7 @@ def download_firmware(env: str, url: str, log=print) -> str | None:
         os.remove(tmp)
         return None
     os.replace(tmp, dest)
+    log(f"sha256 ок: {got[:16]}…")
     return dest
 
 

@@ -30,7 +30,8 @@ STYLE = """
 QWidget {
     background: #0b0e14;
     color: #e6ebf2;
-    font-family: "Segoe UI";
+    font-family: "Bahnschrift", "Segoe UI";
+    font-weight: 600;
     font-size: 13px;
 }
 QLabel#title { font-size: 19px; font-weight: 700; }
@@ -112,6 +113,9 @@ QFrame#badge {
     background: #161e2b; border: 1px solid #222c3c; border-radius: 11px;
 }
 QLabel#badgeText { color: #98a3b3; font-size: 11px; font-weight: 600; }
+QLabel#orLabel {
+    color: #33415a; font-size: 15px; font-weight: 700; letter-spacing: 8px;
+}
 QFrame#badge QLabel, QFrame#dropZone QLabel { background: transparent; }
 """
 
@@ -167,14 +171,6 @@ class MainWindow(QMainWindow):
         # header
         head = QHBoxLayout()
         head.setSpacing(12)
-        logo = QLabel()
-        icon_path = os.path.join(cfg.app_dir(), "app.ico")
-        if os.path.isfile(icon_path):
-            logo.setPixmap(QIcon(icon_path).pixmap(36, 36))
-        else:
-            logo.setPixmap(self._logo_pixmap(36))
-        logo.setFixedSize(36, 36)
-        head.addWidget(logo)
 
         titles = QVBoxLayout()
         titles.setSpacing(0)
@@ -218,9 +214,6 @@ class MainWindow(QMainWindow):
         self.role_box.setMinimumWidth(240)
         row.addWidget(self.role_box, 2)
 
-        self.btn_online = QPushButton("Скачать с GitHub")
-        self.btn_online.clicked.connect(self.download_online)
-        row.addWidget(self.btn_online, 1)
         btn_rescan = QPushButton("Обновить")
         btn_rescan.clicked.connect(self.rescan_firmware)
         row.addWidget(btn_rescan)
@@ -245,6 +238,11 @@ class MainWindow(QMainWindow):
         self.fw_lbl.setObjectName("hint")
         self.fw_lbl.setWordWrap(False)
         root.addWidget(self.fw_lbl)
+
+        or_lbl = QLabel("ИЛИ")
+        or_lbl.setObjectName("orLabel")
+        or_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        root.addWidget(or_lbl)
 
         # drop zone
         self.drop = QFrame()
@@ -539,57 +537,65 @@ class MainWindow(QMainWindow):
                 f"версия прошивки: {self.selected_release['tag']} · "
                 f"{self.selected_release['date']}", "dim")
 
-    def download_online(self) -> None:
-        if self.busy:
-            return
-        env = self._env()
-        if not env:
-            return
-        rel = self.selected_release
-        if rel and rel.get("files", {}).get(env):
-            self.log_msg(f"качаю {rel['tag']} для роли "
-                         f"«{cfg.role_title(self.role_slug)}»", "info")
-
-            def work_rel() -> None:
-                path = cfg.download_firmware(
-                    env, rel["files"][env],
-                    log=lambda m: self.q.put(("log", m, "dim")))
-                if path:
-                    self.q.put(("online_ready", path))
-
-            threading.Thread(target=work_rel, daemon=True).start()
-            return
-
-        self.log_msg("читаю манифест с GitHub…", "info")
-
-        def work() -> None:
-            try:
-                man = cfg.fetch_manifest()
-            except Exception as e:  # noqa: BLE001
-                self.q.put(("log", f"манифест недоступен: {e}", "err"))
-                return
-            files = man.get("files") if isinstance(man.get("files"), dict) else {}
-            url = files.get(env)
-            if not url:
-                self.q.put(("log", f"в манифесте v{man.get('version', '?')} "
-                                   f"нет файла для этой роли", "err"))
-                return
-            self.q.put(("log", f"качаю {os.path.basename(url)}", "info"))
-            path = cfg.download_firmware(
-                env, url, log=lambda m: self.q.put(("log", m, "dim")))
-            if path:
-                self.q.put(("online_ready", path))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    # -------------------------------------------------------------- прошивка
     def flash_current(self) -> None:
         if self.busy:
             return
-        if not self.info or not self.file_path:
+        env = self._env()
+        rel = self.selected_release
+        info = rel["files"].get(env) if rel else None
+        if info:
+            local = cfg.scan_firmware().get(env)
+            sig_ok = False
+            if local and os.path.isfile(local):
+                if not info.get("sha256"):
+                    sig_ok = True
+                else:
+                    try:
+                        sig_ok = cfg.file_sha256(local) == info["sha256"]
+                    except OSError:
+                        sig_ok = False
+            if not sig_ok:
+                self._download_and_flash()
+                return
+            self._apply_file(local)
+            self._begin_flash()
+            return
+        # Релиз не выбран — работаем с тем, что лежит в firmware.
+        if not self.info or not self.file_path or not os.path.isfile(self.file_path):
             self.rescan_firmware()
         if not self.info or not self.file_path:
-            self.log_msg("нет прошивки для этой роли", "err")
+            self.log_msg("нет файла: выбери версию прошивки или положи .uf2 "
+                         "в папку firmware", "err")
+            return
+        self._begin_flash()
+
+    def _download_and_flash(self) -> None:
+        env = self._env()
+        rel = self.selected_release
+        info = rel["files"].get(env) if rel else None
+        if not info or not info.get("url"):
+            self.log_msg("нет файла: выбери версию прошивки или положи .uf2 "
+                         "в папку firmware", "err")
+            return
+        self.busy = True
+        self.set_progress(0)
+        self.set_status("скачивание прошивки…")
+        self.log_msg(f"скачиваю {rel['tag']} для "
+                     f"«{cfg.role_title(self.role_slug)}»", "info")
+
+        def work() -> None:
+            def prog(done: int, total: int, speed: float) -> None:
+                self.q.put(("dl_progress", done, total, speed))
+
+            path = cfg.download_firmware(
+                env, info["url"], info.get("sha256", ""), progress=prog,
+                log=lambda m: self.q.put(("log", m, "dim")))
+            self.q.put(("dl_done", path))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _begin_flash(self) -> None:
+        if not self.info:
             return
         if self.info.family != UF2_FAMILY_NRF52840:
             self.log_msg(f"это UF2 для {family_name(self.info.family)}, "
@@ -607,7 +613,7 @@ class MainWindow(QMainWindow):
             return
         self.busy = True
         self.watcher.pause()
-        self.set_progress(0)
+        self.set_progress(0.15)
         self.set_status(f"пишу {fmt_size(self.info.size)} — НЕ ОТКЛЮЧАЙ плату")
         self.log_msg(f"пишу {fmt_size(self.info.size)} на {vol.title}", "info")
         FlashJob(self.q, self.info, vol).start()
@@ -700,9 +706,25 @@ class MainWindow(QMainWindow):
                 elif kind == "progress":
                     done, total = ev[1], ev[2]
                     if total:
-                        self.set_progress((done / total) * 0.72)
+                        self.set_progress(0.15 + (done / total) * 0.55)
                         self.set_status(f"пишу {fmt_size(done)} из "
                                         f"{fmt_size(total)} — НЕ ОТКЛЮЧАЙ плату")
+                elif kind == "dl_progress":
+                    done, total, speed = ev[1], ev[2], ev[3]
+                    frac = (done / total) if total else 0.5
+                    self.set_progress(0.15 * frac)
+                    mb = speed / (1024 * 1024)
+                    self.set_status(f"скачивание: {frac * 100:.0f}% · "
+                                    f"{mb:.1f} МБ/с")
+                elif kind == "dl_done":
+                    self.busy = False
+                    if ev[1]:
+                        self._apply_file(ev[1])
+                        self.set_progress(0.15)
+                        self._begin_flash()
+                    else:
+                        self.set_progress(0)
+                        self.set_status("скачивание не удалось — смотри лог")
                 elif kind == "flash":
                     self._on_flash(ev[1])
                 elif kind == "status":
@@ -753,7 +775,7 @@ class MainWindow(QMainWindow):
             self.set_status("жду плату в режиме загрузчика — дважды нажми Reset")
             return
         if res.ok:
-            self.set_progress(0.72)
+            self.set_progress(0.70)
             if res.rebooted:
                 self.set_status(f"записано за {res.elapsed:.1f} с")
                 self.log_msg(f"готово за {res.elapsed:.1f} с — плата "
