@@ -11,9 +11,11 @@ import sys
 import threading
 import time
 
-from PyQt6.QtCore import Qt, QTimer, QVariantAnimation, QEasingCurve
+from PyQt6.QtCore import (Qt, QTimer, QVariantAnimation, QEasingCurve,
+                          QEvent)
 from PyQt6.QtGui import QFont, QIcon, QPixmap, QPainter, QColor, QPen, QFontMetrics
 from PyQt6.QtWidgets import (
+    QGraphicsDropShadowEffect,
     QApplication, QComboBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout,
     QLabel, QLineEdit, QMainWindow, QTextEdit, QProgressBar, QPushButton,
     QSizePolicy, QVBoxLayout, QWidget, QCheckBox,
@@ -149,6 +151,7 @@ class MainWindow(QMainWindow):
             self.setWindowIcon(QIcon(icon))
 
         self._build()
+        self._install_glow()
         self._log_banner()
 
         self.watcher = VolumeWatcher(self.q)
@@ -405,6 +408,26 @@ class MainWindow(QMainWindow):
         links.addStretch(1)
         root.addLayout(links)
 
+    def _install_glow(self) -> None:
+        """Неоновое свечение вокруг полей и кнопок при наведении."""
+        widgets = (self.findChildren(QLineEdit) + self.findChildren(QComboBox)
+                   + self.findChildren(QPushButton))
+        for w in widgets:
+            w.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+            w.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if isinstance(obj, (QLineEdit, QComboBox, QPushButton)):
+            if event.type() == QEvent.Type.Enter:
+                eff = QGraphicsDropShadowEffect(obj)
+                eff.setBlurRadius(18)
+                eff.setColor(QColor(78, 165, 131, 190))
+                eff.setOffset(0, 0)
+                obj.setGraphicsEffect(eff)
+            elif event.type() == QEvent.Type.Leave:
+                obj.setGraphicsEffect(None)
+        return super().eventFilter(obj, event)
+
     def _logo_pixmap(self, size: int) -> QPixmap:
         pm = QPixmap(size, size)
         pm.fill(QColor(0, 0, 0, 0))
@@ -629,8 +652,8 @@ class MainWindow(QMainWindow):
         if len(self.vols) == 1:
             self._start_flash(self.vols[0])
         else:
-            self.set_status("жду плату в режиме загрузчика — дважды нажми Reset")
-            self.log_msg("жду плату в режиме загрузчика…", "warn")
+            self.set_status("жду плату в режиме загрузчика — быстро нажми RESET на плате ДВА раза")
+            self.log_msg("жду плату в режиме загрузчика… (быстро нажми RESET два раза)", "warn")
 
     def _start_flash(self, vol) -> None:
         if self.busy or not self.info:
@@ -803,7 +826,7 @@ class MainWindow(QMainWindow):
         self.watcher.resume()
         if res.no_volume:
             self.log_msg("не успел поймать диск — жду ещё раз, нажми Reset", "warn")
-            self.set_status("жду плату в режиме загрузчика — дважды нажми Reset")
+            self.set_status("жду плату в режиме загрузчика — быстро нажми RESET на плате ДВА раза")
             return
         if res.ok:
             self.set_progress(0.70)
