@@ -405,7 +405,7 @@ class MainWindow(QMainWindow):
             lb.setOpenExternalLinks(True)
             lb.setCursor(Qt.CursorShape.PointingHandCursor)
             links.addWidget(lb)
-        links.addStretch(1)
+        links.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         root.addLayout(links)
 
     def _install_glow(self) -> None:
@@ -415,9 +415,15 @@ class MainWindow(QMainWindow):
         for w in widgets:
             w.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
             w.installEventFilter(self)
+        for lb in self.findChildren(QLabel):
+            if lb.objectName() == "link":
+                lb.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+                lb.installEventFilter(self)
 
     def eventFilter(self, obj, event):
-        if isinstance(obj, (QLineEdit, QComboBox, QPushButton)):
+        is_link = (isinstance(obj, QLabel)
+                   and obj.objectName() == "link")
+        if isinstance(obj, (QLineEdit, QComboBox, QPushButton)) or is_link:
             if event.type() == QEvent.Type.Enter:
                 eff = QGraphicsDropShadowEffect(obj)
                 eff.setBlurRadius(18)
