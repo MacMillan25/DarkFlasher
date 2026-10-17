@@ -397,20 +397,18 @@ def download_firmware(env: str, url: str, sha256: str = "",
 # ------------------------------------------------------------- CLI по USB
 
 def find_meshcore_port(protocol: str = "frames",
-                       timeout: float = 12.0) -> str | None:
+                       timeout: float = 15.0) -> str | None:
     """Ищет ноду среди портов nRF: та, что ответила как MeshCore.
 
-    Чужая nRF52 на компьютере тоже видна по VID, поэтому порт нельзя брать
-    первым попавшимся — проверяем ответ на `ver`.
+    Порт нельзя брать первым попавшимся (чужая nRF52 тоже видна по VID),
+    а после прошивки нода ещё грузится — поэтому опрашиваем все порты
+    по кругу до таймаута, а не один раз.
     """
-    checked: list[str] = []
     deadline = time.time() + timeout
     while time.time() < deadline:
         for port in nrf_ports():
-            if port in checked:
-                continue
-            checked.append(port)
-            ver = read_version(port, protocol=protocol, dtr=True)
+            ver = read_version(port, protocol=protocol, dtr=True,
+                               timeout=1.5)
             if ver and ("v1." in ver or "repeater" in ver.lower()
                         or "id:" in ver.lower() or "ok" in ver.lower()):
                 return port
