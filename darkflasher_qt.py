@@ -53,7 +53,6 @@ QLineEdit, QComboBox {
 }
 QLineEdit:hover, QComboBox:hover { border-color: #33415a; }
 QLineEdit:focus, QComboBox:focus { border-color: #4ea583; }
-QComboBox::drop-down { border: none; width: 22px; }
 QComboBox QAbstractItemView {
     background: #161e2b;
     border: 1px solid #33415a;
