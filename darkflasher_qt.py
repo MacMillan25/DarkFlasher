@@ -595,6 +595,7 @@ class MainWindow(QMainWindow):
     def flash_current(self) -> None:
         if self.busy:
             return
+        self._manual_flash = False
         env = self._env()
         rel = self.selected_release
         info = rel["files"].get(env) if rel else None
@@ -845,7 +846,14 @@ class MainWindow(QMainWindow):
             else:
                 self.set_status("записано, но плата не перезагрузилась — нажми Reset")
                 self.log_msg("файл записан, но том не исчез", "warn")
-            self._start_settings_send()
+            if not getattr(self, "_manual_flash", False):
+                self._start_settings_send()
+            else:
+                self.set_progress(1.0)
+                self.set_status("готово (файл выбран вручную, "
+                                "настройки не отправлялись)")
+                self.log_msg("настройки не отправлялись: файл выбран вручную",
+                             "warn")
         else:
             self.set_progress(0)
             msg = res.message
@@ -872,8 +880,11 @@ class MainWindow(QMainWindow):
         self._apply_file(path)
         if not self.info:
             return
-        self.log_msg(f"файл: {os.path.basename(path)}", "info")
-        self.flash_current()
+        # Файл выбран вручную: шьём именно его, без сверки с релизом,
+        # и не отправляем настройки — прошивка может быть чужая.
+        self._manual_flash = True
+        self.log_msg(f"файл: {os.path.basename(path)} — шью как есть", "info")
+        self._begin_flash()
 
     def closeEvent(self, e) -> None:
         self.timer.stop()
