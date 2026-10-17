@@ -385,7 +385,7 @@ def send_commands_batch(port: str, commands: list[str], log=print,
             log(f"> {cmd}")
             if progress:
                 progress(0.3 + 0.5 * (commands.index(cmd) + 1) / len(commands))
-            reply = _read_cli_reply(ser, timeout=2.5)
+            reply = _read_cli_reply(ser, timeout=3.5)
             if reply:
                 log(f"< {reply}")
                 low = reply.lower()
@@ -413,7 +413,29 @@ def send_commands_batch(port: str, commands: list[str], log=print,
     return ok
 
 
-def _read_cli_reply(ser, timeout: float = 2.5) -> str:
+def read_version(port: str, timeout: float = 2.5) -> str:
+    """Спрашивает у ноды версию прошивки (CLI `ver`)."""
+    try:
+        ser = open_serial(port)
+    except Exception:
+        return ""
+    try:
+        ser.reset_input_buffer()
+        payload = bytes([CMD_RUN_CLI]) + b"ver"
+        ser.write(b"<" + bytes([len(payload) & 0xFF,
+                                (len(payload) >> 8) & 0xFF]) + payload)
+        ser.flush()
+        return _read_cli_reply(ser, timeout)
+    except Exception:
+        return ""
+    finally:
+        try:
+            ser.close()
+        except Exception:
+            pass
+
+
+def _read_cli_reply(ser, timeout: float = 3.5) -> str:
     """Читает один кадр `>` + len + payload и возвращает текст CLI-ответа."""
     deadline = time.time() + timeout
     buf = b""

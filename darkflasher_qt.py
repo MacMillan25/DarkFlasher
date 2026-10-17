@@ -623,6 +623,13 @@ class MainWindow(QMainWindow):
         return None
 
     def _send_thread(self, port: str, prefix: float) -> None:
+        ver = cfg.read_version(port)
+        if ver:
+            self.q.put(("log", f"нода: {ver}", "info"))
+            if "1.18.0d" not in ver:
+                self.q.put(("log", "прошивка на ноде старая — часть команд "
+                                   "неизвестна. Прошей darktec-v1.18.0d1", "warn"))
+
         def progress(p: float) -> None:
             self.q.put(("settings_progress", prefix + (1.0 - prefix) * p))
 
