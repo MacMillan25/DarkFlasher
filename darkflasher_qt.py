@@ -114,7 +114,7 @@ QFrame#badge {
 }
 QLabel#badgeText { color: #98a3b3; font-size: 11px; font-weight: 600; }
 QLabel#orLabel {
-    color: #33415a; font-size: 15px; font-weight: 700; letter-spacing: 8px;
+    color: #33415a; font-size: 13px; font-weight: 700;
 }
 QFrame#badge QLabel, QFrame#dropZone QLabel { background: transparent; }
 QLabel#link { background: transparent; font-size: 12px; }
@@ -141,8 +141,8 @@ class MainWindow(QMainWindow):
         self._progress = 0
 
         self.setWindowTitle("Dark Flasher — nRF52 UF2")
-        self.setMinimumSize(820, 1040)
-        self.resize(880, 1090)
+        self.setMinimumSize(620, 780)
+        self.resize(660, 820)
         self.setAcceptDrops(True)
         icon = os.path.join(cfg.app_dir(), "app.ico")
         if os.path.isfile(icon):
@@ -169,8 +169,8 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setContentsMargins(22, 18, 22, 18)
-        root.setSpacing(12)
+        root.setContentsMargins(18, 14, 18, 14)
+        root.setSpacing(9)
 
         # header
         head = QHBoxLayout()
@@ -223,7 +223,6 @@ class MainWindow(QMainWindow):
         self.role_box.currentTextChanged.connect(self.on_role_change)
         self.role_box.setFixedWidth(220)
         rrow.addWidget(self.role_box)
-        rrow.addStretch(1)
         left.addLayout(rrow)
 
         vrow = QHBoxLayout()
@@ -237,13 +236,12 @@ class MainWindow(QMainWindow):
         self.version_box.setEnabled(False)
         self.version_box.currentIndexChanged.connect(self._on_version_change)
         vrow.addWidget(self.version_box)
-        vrow.addStretch(1)
         left.addLayout(vrow)
         top.addLayout(left, 0)
 
         or_lbl = QLabel("ИЛИ")
         or_lbl.setObjectName("orLabel")
-        or_lbl.setFixedWidth(44)
+        or_lbl.setFixedWidth(40)
         or_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         top.addWidget(or_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
 
@@ -386,7 +384,7 @@ class MainWindow(QMainWindow):
         root.addWidget(log_sec)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
-        self.log.setMinimumHeight(240)
+        self.log.setMinimumHeight(170)
         root.addWidget(self.log, 1)
 
         links = QHBoxLayout()
