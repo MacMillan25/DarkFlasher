@@ -328,10 +328,11 @@ class MainWindow(QMainWindow):
                       hint: str = "") -> None:
             lb = QLabel(label)
             lb.setObjectName("fieldLabel")
+            lb.setMinimumWidth(124)
             ed = QLineEdit(str(self.settings.get(key, "")))
             if hint:
                 ed.setPlaceholderText(hint)
-            ed.setFixedWidth(210)
+            ed.setFixedWidth(160)
             ed.textChanged.connect(self._on_setting_changed)
             form.addRow(lb, ed)
             self.fields[key] = ed
@@ -346,6 +347,7 @@ class MainWindow(QMainWindow):
 
         mod_lb = QLabel("Модуль")
         mod_lb.setObjectName("fieldLabel")
+        mod_lb.setMinimumWidth(124)
         self.module_box = QComboBox()
         for _i, title in cfg.MODULES:
             self.module_box.addItem(title)
@@ -354,7 +356,7 @@ class MainWindow(QMainWindow):
         self.module_box.setCurrentIndex(idx)
         self.module_box.currentTextChanged.connect(
             lambda _t: self._on_setting_changed())
-        self.module_box.setFixedWidth(210)
+        self.module_box.setFixedWidth(160)
         right.addRow(mod_lb, self.module_box)
 
         add_field(right, "Коэф. АЦП", "adc", "1.750")
