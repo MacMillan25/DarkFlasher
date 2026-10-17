@@ -25,15 +25,15 @@ NRF_VIDS = {0x239A, 0x1915}
 
 # Роль -> env PlatformIO.
 ROLES: list[tuple[str, str, str]] = [
-    ("companion_radio_ble", "Компаньон (BLE)", "Darktec_companion_radio_ble"),
-    ("companion_radio_usb", "Компаньон (USB)", "Darktec_companion_radio_usb"),
-    ("repeater", "Репитер", "Darktec_repeater"),
-    ("repeater_bridge_rs232_serial1", "Репитер + мост RS232",
+    ("companion_radio_ble", "Companion (BLE)", "Darktec_companion_radio_ble"),
+    ("companion_radio_usb", "Companion (USB)", "Darktec_companion_radio_usb"),
+    ("repeater", "Repeater", "Darktec_repeater"),
+    ("repeater_bridge_rs232_serial1", "Repeater + RS232",
      "Darktec_repeater_bridge_rs232_serial1"),
-    ("room_server", "Комнатный сервер", "Darktec_room_server"),
-    ("sensor", "Сенсор + GPS", "Darktec_sensor"),
-    ("terminal_chat", "Чат с терминала", "Darktec_terminal_chat"),
-    ("kiss_modem", "KISS-модем", "Darktec_kiss_modem"),
+    ("room_server", "Room server", "Darktec_room_server"),
+    ("sensor", "Sensor + GPS", "Darktec_sensor"),
+    ("terminal_chat", "Terminal chat", "Darktec_terminal_chat"),
+    ("kiss_modem", "KISS modem", "Darktec_kiss_modem"),
 ]
 
 ROLE_TITLES = {slug: title for slug, title, _env in ROLES}

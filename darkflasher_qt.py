@@ -117,6 +117,7 @@ QLabel#orLabel {
     color: #33415a; font-size: 15px; font-weight: 700; letter-spacing: 8px;
 }
 QFrame#badge QLabel, QFrame#dropZone QLabel { background: transparent; }
+QLabel#link { background: transparent; font-size: 12px; }
 """
 
 
@@ -155,6 +156,9 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._pump)
         self.timer.start(70)
+        self.badge_timer = QTimer(self)
+        self.badge_timer.timeout.connect(self._update_badge)
+        self.badge_timer.start(2000)
         self.releases: list[dict] = []
         self.selected_release: dict | None = None
         self.rescan_firmware()
@@ -211,8 +215,9 @@ class MainWindow(QMainWindow):
             self.role_box.addItem(title)
         self.role_box.setCurrentText(cfg.role_title(self.role_slug))
         self.role_box.currentTextChanged.connect(self.on_role_change)
-        self.role_box.setMinimumWidth(240)
-        row.addWidget(self.role_box, 2)
+        self.role_box.setFixedWidth(200)
+        row.addWidget(self.role_box)
+        row.addStretch(1)
 
         btn_rescan = QPushButton("Обновить")
         btn_rescan.clicked.connect(self.rescan_firmware)
@@ -378,8 +383,23 @@ class MainWindow(QMainWindow):
         root.addWidget(log_sec)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
-        self.log.setMinimumHeight(260)
+        self.log.setMinimumHeight(240)
         root.addWidget(self.log, 1)
+
+        links = QHBoxLayout()
+        links.setSpacing(18)
+        for text, url in (
+            ("Группа в Telegram", "https://t.me/DarkElectronics"),
+            ("Покупка нод DarkTec", "https://t.me/Dark_Electronics"),
+        ):
+            lb = QLabel(f'<a href="{url}" style="color:#4ea583;'
+                        f'text-decoration:none;">{text}</a>')
+            lb.setObjectName("link")
+            lb.setOpenExternalLinks(True)
+            lb.setCursor(Qt.CursorShape.PointingHandCursor)
+            links.addWidget(lb)
+        links.addStretch(1)
+        root.addLayout(links)
 
     def _logo_pixmap(self, size: int) -> QPixmap:
         pm = QPixmap(size, size)
@@ -752,24 +772,30 @@ class MainWindow(QMainWindow):
         except queue.Empty:
             pass
 
-    def _set_badge(self, connected: bool) -> None:
-        if connected:
-            self.badge_lbl.setText("ПЛАТА ПОДКЛЮЧЕНА")
-            self.badge_dot.setStyleSheet(
-                "background:#4ea583;border-radius:4px;")
-            self.badge.setStyleSheet(
-                "QFrame#badge{background:#14301f;border:1px solid #2f7a5f;"
-                "border-radius:13px;}")
-        else:
-            self.badge_lbl.setText("НЕТ ПЛАТЫ")
-            self.badge_dot.setStyleSheet(
-                "background:#d96a6a;border-radius:4px;")
-            self.badge.setStyleSheet(
-                "QFrame#badge{background:#2a1618;border:1px solid #6e2f35;"
-                "border-radius:13px;}")
+    def _set_badge(self, state: str) -> None:
+        styles = {
+            "boot": ("BOOT · можно прошивать", "#4ea583",
+                     "background:#14301f;border:1px solid #2f7a5f;"
+                     "border-radius:13px;"),
+            "com": ("COM · нода на связи", "#6cb6ff",
+                    "background:#132133;border:1px solid #2f5f8a;"
+                    "border-radius:13px;"),
+            "off": ("НЕТ ПЛАТЫ", "#d96a6a",
+                    "background:#2a1618;border:1px solid #6e2f35;"
+                    "border-radius:13px;"),
+        }
+        text, color, frame = styles.get(state, styles["off"])
+        self.badge_lbl.setText(text)
+        self.badge_dot.setStyleSheet(f"background:{color};border-radius:4px;")
+        self.badge.setStyleSheet("QFrame#badge{" + frame + "}")
 
     def _update_badge(self) -> None:
-        self._set_badge(bool(self.vols))
+        if self.vols:
+            self._set_badge("boot")
+        elif cfg.nrf_ports():
+            self._set_badge("com")
+        else:
+            self._set_badge("off")
 
     def _on_flash(self, res: FlashResult) -> None:
         self.busy = False
