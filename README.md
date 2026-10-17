@@ -1,4 +1,4 @@
-# Dark Flasher 1.1
+# Dark Flasher 1.0
 
 Тёмная прошивалка `.uf2` для nRF52 (nice!nano и совместимые платы).
 
