@@ -53,6 +53,9 @@ QLineEdit, QComboBox {
 }
 QLineEdit:hover, QComboBox:hover { border-color: #33415a; }
 QLineEdit:focus, QComboBox:focus { border-color: #4ea583; }
+QComboBox { background: #1b2433; padding-right: 9px; }
+QComboBox::drop-down { border: none; width: 0px; }
+QComboBox::down-arrow { image: none; width: 0px; height: 0px; }
 QComboBox QAbstractItemView {
     background: #161e2b;
     border: 1px solid #33415a;
@@ -313,39 +316,35 @@ class MainWindow(QMainWindow):
         root.addWidget(sec)
 
         forms = QHBoxLayout()
-        forms.setSpacing(24)
+        forms.setSpacing(20)
         self.fields: dict[str, QLineEdit] = {}
         self.combos: dict[str, QComboBox] = {}
         BW = [7.8, 10.4, 15.6, 20.8, 31.25, 41.7, 62.5, 125,
               203.125, 250, 406.25, 500]
-        left = QVBoxLayout()
-        left.setSpacing(8)
-        right = QVBoxLayout()
-        right.setSpacing(8)
+        left = QFormLayout()
+        right = QFormLayout()
+        for form in (left, right):
+            form.setHorizontalSpacing(6)
+            form.setVerticalSpacing(8)
+            form.setLabelAlignment(Qt.AlignmentFlag.AlignRight |
+                                   Qt.AlignmentFlag.AlignVCenter)
+            form.setFormAlignment(Qt.AlignmentFlag.AlignLeft |
+                                  Qt.AlignmentFlag.AlignTop)
 
         def add_line(form, label, key, hint=""):
-            row = QHBoxLayout()
-            row.setSpacing(6)
             lb = QLabel(label)
             lb.setObjectName("fieldLabel")
-            lb.setFixedWidth(112)
             ed = QLineEdit(str(self.settings.get(key, "")))
             if hint:
                 ed.setPlaceholderText(hint)
             ed.setFixedWidth(150)
             ed.textChanged.connect(self._on_setting_changed)
-            row.addWidget(lb)
-            row.addWidget(ed)
-            row.addStretch(1)
-            form.addLayout(row)
+            form.addRow(lb, ed)
             self.fields[key] = ed
 
         def add_choice(form, label, key, values, fmt):
-            row = QHBoxLayout()
-            row.setSpacing(6)
             lb = QLabel(label)
             lb.setObjectName("fieldLabel")
-            lb.setFixedWidth(112)
             cb = QComboBox()
             cb.setFixedWidth(150)
             for v in values:
@@ -356,10 +355,7 @@ class MainWindow(QMainWindow):
             cb.setCurrentIndex(idx)
             cb.currentIndexChanged.connect(
                 lambda _i: self._on_setting_changed())
-            row.addWidget(lb)
-            row.addWidget(cb)
-            row.addStretch(1)
-            form.addLayout(row)
+            form.addRow(lb, cb)
             self.combos[key] = cb
 
         add_line(left, "Имя ноды", "name", "не задано")
@@ -370,11 +366,8 @@ class MainWindow(QMainWindow):
         add_line(right, "Мощность, dBm", "tx", "-9..22")
         add_line(right, "Ёмкость, мАч", "capacity", "1000..10000")
 
-        mod_row = QHBoxLayout()
-        mod_row.setSpacing(6)
         mod_lb = QLabel("Модуль")
         mod_lb.setObjectName("fieldLabel")
-        mod_lb.setFixedWidth(112)
         self.module_box = QComboBox()
         self.module_box.setFixedWidth(150)
         for _i, title in cfg.MODULES:
@@ -384,10 +377,7 @@ class MainWindow(QMainWindow):
         self.module_box.setCurrentIndex(idx)
         self.module_box.currentTextChanged.connect(
             lambda _t: self._on_setting_changed())
-        mod_row.addWidget(mod_lb)
-        mod_row.addWidget(self.module_box)
-        mod_row.addStretch(1)
-        right.addLayout(mod_row)
+        right.addRow(mod_lb, self.module_box)
 
         add_line(right, "Коэф. АЦП", "adc", "1.750")
         forms.addLayout(left, 1)
