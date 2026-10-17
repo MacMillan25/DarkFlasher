@@ -440,6 +440,85 @@ def _text_cmd(port: str, cmd: str, timeout: float = 2.5) -> str:
             pass
 
 
+def _read_line(ser, timeout: float = 5.0) -> str:
+    """Читает ответ текстового CLI: ждёт строку с OK/Error/Unknown.
+
+    Репитер отвечает не сразу и иногда несколькими строками, поэтому первую
+    строку брать нельзя — собираем всё окно и возвращаем значимую.
+    """
+    ser.timeout = 0.2
+    deadline = time.time() + timeout
+    buf = b""
+    meaningful = ""
+    while time.time() < deadline:
+        try:
+            chunk = ser.read(256)
+        except Exception:
+            break
+        if chunk:
+            buf += chunk
+            text = buf.decode("utf-8", "replace")
+            for line in text.splitlines():
+                t = line.strip()
+                if not t:
+                    continue
+                low = t.lower()
+                if ("ok" in low or "error" in low or "unknown" in low
+                        or t.startswith(">")):
+                    meaningful = t
+            if meaningful:
+                # ответ пришёл, но даём добить хвост
+                time.sleep(0.15)
+                break
+    if meaningful:
+        return meaningful
+    return buf.decode("utf-8", "replace").strip()
+
+
+def read_version(port: str, protocol: str = "frames",
+                 timeout: float = 2.5) -> str:
+    """Спрашивает у ноды версию прошивки (CLI `ver`)."""
+    if protocol == "text":
+        return _text_cmd(port, "ver", timeout)
+    try:
+        ser = open_serial(port)
+    except Exception:
+        return ""
+    try:
+        ser.reset_input_buffer()
+        payload = bytes([CMD_RUN_CLI]) + b"ver"
+        ser.write(b"<" + bytes([len(payload) & 0xFF,
+                                (len(payload) >> 8) & 0xFF]) + payload)
+        ser.flush()
+        return _read_cli_reply(ser, timeout)
+    except Exception:
+        return ""
+    finally:
+        try:
+            ser.close()
+        except Exception:
+            pass
+
+
+def _text_cmd(port: str, cmd: str, timeout: float = 2.5) -> str:
+    try:
+        ser = open_serial(port)
+    except Exception:
+        return ""
+    try:
+        ser.reset_input_buffer()
+        ser.write((cmd + "\r\n").encode("ascii", "replace"))
+        ser.flush()
+        return _read_line(ser, timeout)
+    except Exception:
+        return ""
+    finally:
+        try:
+            ser.close()
+        except Exception:
+            pass
+
+
 def _read_line(ser, timeout: float = 2.5) -> str:
     ser.timeout = 0.2
     deadline = time.time() + timeout
@@ -551,7 +630,7 @@ def _send_text(port: str, commands: list[str], log=print,
             log(f"> {cmd}")
             if progress:
                 progress(0.3 + 0.5 * (idx + 1) / max(1, n))
-            reply = _read_line(ser, 3.0)
+            reply = _read_line(ser, 5.0)
             if reply:
                 log(f"< {reply}")
                 low = reply.lower()

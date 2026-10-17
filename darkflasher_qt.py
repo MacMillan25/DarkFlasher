@@ -635,7 +635,7 @@ class MainWindow(QMainWindow):
         ver = cfg.read_version(port, protocol=proto)
         if ver:
             self.q.put(("log", f"нода: {ver}", "info"))
-            if "1.18.0d" not in ver:
+            if proto == "frames" and "1.18.0d" not in ver:
                 self.q.put(("log", "прошивка на ноде старая — часть команд "
                                    "неизвестна. Прошей darktec-v1.18.0d1", "warn"))
 
