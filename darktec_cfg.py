@@ -195,7 +195,7 @@ def nrf_ports() -> list[str]:
     return out
 
 
-def open_serial(port: str):
+def open_serial(port: str, dtr: bool = True):
     """Открывает порт, не дёргая DTR/RTS.
 
     Поднятая DTR часто означает reset/boot у Arduino-совместимых плат;
@@ -209,7 +209,7 @@ def open_serial(port: str):
     ser.write_timeout = 3
     # DTR поднимаем (как обычный терминал), RTS не трогаем: на nRF CDC это
     # не сброс, а чужой порт мы всё равно не открываем.
-    ser.dtr = True
+    ser.dtr = dtr
     ser.rts = False
     ser.open()
     return ser
@@ -396,13 +396,35 @@ def download_firmware(env: str, url: str, sha256: str = "",
 
 # ------------------------------------------------------------- CLI по USB
 
+def find_meshcore_port(protocol: str = "frames",
+                       timeout: float = 12.0) -> str | None:
+    """Ищет ноду среди портов nRF: та, что ответила как MeshCore.
+
+    Чужая nRF52 на компьютере тоже видна по VID, поэтому порт нельзя брать
+    первым попавшимся — проверяем ответ на `ver`.
+    """
+    checked: list[str] = []
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for port in nrf_ports():
+            if port in checked:
+                continue
+            checked.append(port)
+            ver = read_version(port, protocol=protocol, dtr=False)
+            if ver and ("v1." in ver or "repeater" in ver.lower()
+                        or "id:" in ver.lower() or "ok" in ver.lower()):
+                return port
+        time.sleep(0.5)
+    return None
+
+
 def read_version(port: str, protocol: str = "frames",
-                 timeout: float = 2.5) -> str:
+                 timeout: float = 2.5, dtr: bool = True) -> str:
     """Спрашивает у ноды версию прошивки (CLI `ver`)."""
     if protocol == "text":
-        return _text_cmd(port, "ver", timeout)
+        return _text_cmd(port, "ver", timeout, dtr)
     try:
-        ser = open_serial(port)
+        ser = open_serial(port, dtr)
     except Exception:
         return ""
     try:
@@ -421,9 +443,10 @@ def read_version(port: str, protocol: str = "frames",
             pass
 
 
-def _text_cmd(port: str, cmd: str, timeout: float = 2.5) -> str:
+def _text_cmd(port: str, cmd: str, timeout: float = 2.5,
+              dtr: bool = True) -> str:
     try:
-        ser = open_serial(port)
+        ser = open_serial(port, dtr)
     except Exception:
         return ""
     try:
@@ -472,66 +495,6 @@ def _read_line(ser, timeout: float = 5.0) -> str:
                 break
     if meaningful:
         return meaningful
-    return buf.decode("utf-8", "replace").strip()
-
-
-def read_version(port: str, protocol: str = "frames",
-                 timeout: float = 2.5) -> str:
-    """Спрашивает у ноды версию прошивки (CLI `ver`)."""
-    if protocol == "text":
-        return _text_cmd(port, "ver", timeout)
-    try:
-        ser = open_serial(port)
-    except Exception:
-        return ""
-    try:
-        ser.reset_input_buffer()
-        payload = bytes([CMD_RUN_CLI]) + b"ver"
-        ser.write(b"<" + bytes([len(payload) & 0xFF,
-                                (len(payload) >> 8) & 0xFF]) + payload)
-        ser.flush()
-        return _read_cli_reply(ser, timeout)
-    except Exception:
-        return ""
-    finally:
-        try:
-            ser.close()
-        except Exception:
-            pass
-
-
-def _text_cmd(port: str, cmd: str, timeout: float = 2.5) -> str:
-    try:
-        ser = open_serial(port)
-    except Exception:
-        return ""
-    try:
-        ser.reset_input_buffer()
-        ser.write((cmd + "\r\n").encode("ascii", "replace"))
-        ser.flush()
-        return _read_line(ser, timeout)
-    except Exception:
-        return ""
-    finally:
-        try:
-            ser.close()
-        except Exception:
-            pass
-
-
-def _read_line(ser, timeout: float = 2.5) -> str:
-    ser.timeout = 0.2
-    deadline = time.time() + timeout
-    buf = b""
-    while time.time() < deadline:
-        try:
-            chunk = ser.read(256)
-        except Exception:
-            break
-        if chunk:
-            buf += chunk
-            if b"\n" in buf:
-                break
     return buf.decode("utf-8", "replace").strip()
 
 

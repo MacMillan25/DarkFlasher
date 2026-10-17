@@ -644,13 +644,10 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------------- COM
     def _wait_nrf_port(self, timeout: float = 15.0) -> str | None:
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            ports = cfg.nrf_ports()
-            if ports:
-                return ports[0]
-            time.sleep(0.5)
-        return None
+        proto = ("frames" if self.role_slug in ("companion_radio_ble",
+                                                "companion_radio_usb")
+                 else "text")
+        return cfg.find_meshcore_port(proto, timeout)
 
     def _send_thread(self, port: str, prefix: float) -> None:
         proto = ("frames" if self.role_slug in ("companion_radio_ble",
@@ -696,18 +693,18 @@ class MainWindow(QMainWindow):
     def send_settings_now(self) -> None:
         if self.busy:
             return
-        ports = cfg.nrf_ports()
-        if not ports:
-            self.log_msg("портов nRF не видно: подключи плату по USB", "err")
+        port = self._wait_nrf_port(10.0)
+        if not port:
+            self.log_msg("нода не ответила ни на одном порту nRF — "
+                         "подключи плату по USB", "err")
             return
         self.settings = self._collect()
         cfg.save_settings(self.settings)
-        self.log_msg(f"отправляю настройки на {ports[0]}", "info")
+        self.log_msg(f"отправляю настройки на {port}", "info")
         self.set_progress(0.05)
         threading.Thread(target=self._send_thread,
-                         args=(ports[0], 0.05), daemon=True).start()
+                         args=(port, 0.05), daemon=True).start()
 
-    # ------------------------------------------------------------- прогресс
     def set_progress(self, value: float) -> None:
         target = max(0, min(1000, int(value * 1000)))
         self.anim.stop()
