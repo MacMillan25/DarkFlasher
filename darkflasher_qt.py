@@ -314,41 +314,70 @@ class MainWindow(QMainWindow):
         root.addWidget(sec)
 
         forms = QHBoxLayout()
-        forms.setSpacing(26)
+        forms.setSpacing(24)
         self.fields: dict[str, QLineEdit] = {}
-        left = QFormLayout()
-        right = QFormLayout()
-        for f in (left, right):
-            f.setHorizontalSpacing(10)
-            f.setVerticalSpacing(9)
-            f.setLabelAlignment(Qt.AlignmentFlag.AlignRight |
-                                Qt.AlignmentFlag.AlignVCenter)
+        self.combos: dict[str, QComboBox] = {}
+        BW = [7.8, 10.4, 15.6, 20.8, 31.25, 41.7, 62.5, 125,
+              203.125, 250, 406.25, 500]
+        left = QVBoxLayout()
+        left.setSpacing(8)
+        right = QVBoxLayout()
+        right.setSpacing(8)
 
-        def add_field(form: QFormLayout, label: str, key: str,
-                      hint: str = "") -> None:
+        def add_line(form, label, key, hint=""):
+            row = QHBoxLayout()
+            row.setSpacing(6)
             lb = QLabel(label)
             lb.setObjectName("fieldLabel")
-            lb.setMinimumWidth(124)
+            lb.setFixedWidth(112)
             ed = QLineEdit(str(self.settings.get(key, "")))
             if hint:
                 ed.setPlaceholderText(hint)
-            ed.setFixedWidth(160)
+            ed.setFixedWidth(150)
             ed.textChanged.connect(self._on_setting_changed)
-            form.addRow(lb, ed)
+            row.addWidget(lb)
+            row.addWidget(ed)
+            row.addStretch(1)
+            form.addLayout(row)
             self.fields[key] = ed
 
-        add_field(left, "Имя ноды", "name", "не задано")
-        add_field(left, "Частота, МГц", "freq")
-        add_field(left, "Полоса, кГц", "bw")
-        add_field(left, "SF", "sf", "5..12")
-        add_field(left, "CR", "cr", "5..8")
-        add_field(right, "Мощность, dBm", "tx", "-9..22")
-        add_field(right, "Ёмкость, мАч", "capacity", "1000..10000")
+        def add_choice(form, label, key, values, fmt):
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            lb = QLabel(label)
+            lb.setObjectName("fieldLabel")
+            lb.setFixedWidth(112)
+            cb = QComboBox()
+            cb.setFixedWidth(150)
+            for v in values:
+                cb.addItem(fmt(v), v)
+            cur = self.settings.get(key)
+            idx = next((i for i, v in enumerate(values)
+                        if abs(float(v) - float(cur)) < 1e-6), 0)
+            cb.setCurrentIndex(idx)
+            cb.currentIndexChanged.connect(
+                lambda _i: self._on_setting_changed())
+            row.addWidget(lb)
+            row.addWidget(cb)
+            row.addStretch(1)
+            form.addLayout(row)
+            self.combos[key] = cb
 
+        add_line(left, "Имя ноды", "name", "не задано")
+        add_line(left, "Частота, МГц", "freq")
+        add_choice(left, "Полоса, кГц", "bw", BW, lambda v: f"{v:g}")
+        add_choice(left, "SF", "sf", list(range(5, 13)), lambda v: str(v))
+        add_choice(left, "CR", "cr", list(range(5, 9)), lambda v: str(v))
+        add_line(right, "Мощность, dBm", "tx", "-9..22")
+        add_line(right, "Ёмкость, мАч", "capacity", "1000..10000")
+
+        mod_row = QHBoxLayout()
+        mod_row.setSpacing(6)
         mod_lb = QLabel("Модуль")
         mod_lb.setObjectName("fieldLabel")
-        mod_lb.setMinimumWidth(124)
+        mod_lb.setFixedWidth(112)
         self.module_box = QComboBox()
+        self.module_box.setFixedWidth(150)
         for _i, title in cfg.MODULES:
             self.module_box.addItem(title)
         cur = int(self.settings.get("module", 0))
@@ -356,10 +385,12 @@ class MainWindow(QMainWindow):
         self.module_box.setCurrentIndex(idx)
         self.module_box.currentTextChanged.connect(
             lambda _t: self._on_setting_changed())
-        self.module_box.setFixedWidth(160)
-        right.addRow(mod_lb, self.module_box)
+        mod_row.addWidget(mod_lb)
+        mod_row.addWidget(self.module_box)
+        mod_row.addStretch(1)
+        right.addLayout(mod_row)
 
-        add_field(right, "Коэф. АЦП", "adc", "1.750")
+        add_line(right, "Коэф. АЦП", "adc", "1.750")
         forms.addLayout(left, 1)
         forms.addLayout(right, 1)
         root.addLayout(forms)
@@ -490,6 +521,10 @@ class MainWindow(QMainWindow):
                 s[key] = float(raw) if key in ("freq", "bw", "adc") else int(raw)
             except ValueError:
                 pass
+        for key, cb in self.combos.items():
+            val = cb.currentData()
+            if val is not None:
+                s[key] = float(val) if key == "bw" else int(val)
         s["module"] = cfg.MODULES[self.module_box.currentIndex()][0]
         s["send_after_flash"] = bool(self.send_cb.isChecked())
         return s
