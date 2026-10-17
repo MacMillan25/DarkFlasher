@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec
+DarkFlasher/
+MyFlasher/
+*.log
+*.uf2
+*.zip
