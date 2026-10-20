@@ -695,18 +695,49 @@ def pack_factory_payload(settings: dict) -> tuple[bytes, int]:
     return bytes(buf), flags
 
 
-def patch_factory_cfg(image: bytearray, payload: bytes) -> dict:
-    """Вписывает полезную часть в образ на месте метки. Возвращает статистику."""
-    pos = image.find(FACTORY_MARKER)
-    if pos < 0:
+def find_factory_blob(image: bytes) -> int:
+    """Ищет настоящий блок заводских настроек: метка + правдоподобный заголовок.
+
+    Метка может встретиться в образе не один раз (например, если прошивка
+    держит её копию в .rodata). Поэтому кандидатов проверяем по заголовку:
+    версия раскладки, длина и CRC полезной части.
+    """
+    found: list[int] = []
+    start = 0
+    while True:
+        i = image.find(FACTORY_MARKER, start)
+        if i < 0:
+            break
+        start = i + 1
+        if i + FACTORY_HEADER + FACTORY_PAYLOAD > len(image):
+            continue
+        if image[i + 16] != FACTORY_VERSION:
+            continue
+        length = image[i + 17]
+        if length == 0:
+            found.append(i)          # пустая заготовка — то, что нам нужно
+        elif length == FACTORY_PAYLOAD:
+            crc = int.from_bytes(image[i + 20:i + 24], "little")
+            body = bytes(image[i + FACTORY_HEADER:i + FACTORY_HEADER + FACTORY_PAYLOAD])
+            if (zlib.crc32(body) & 0xFFFFFFFF) == crc:
+                found.append(i)
+
+    if not found:
+        if FACTORY_MARKER in image:
+            raise Uf2Error("блок заводских настроек повреждён — прошивка не "
+                           "поймёт настройки. Нужна другая версия прошивки")
         raise Uf2Error("в этой прошивке нет блока заводских настроек — "
                        "она не умеет вшивать параметры. Нужна версия с "
                        "поддержкой (см. релизы прошивки)")
-    if image.find(FACTORY_MARKER, pos + 1) >= 0:
-        raise Uf2Error("метка заводских настроек встречается в образе больше "
-                       "одного раза — патчить нельзя")
-    if pos + FACTORY_HEADER + FACTORY_PAYLOAD > len(image):
-        raise Uf2Error("блок заводских настроек выходит за границу образа")
+    if len(found) > 1:
+        raise Uf2Error("в образе несколько блоков заводских настроек — "
+                       "патчить нельзя, нужна другая версия прошивки")
+    return found[0]
+
+
+def patch_factory_cfg(image: bytearray, payload: bytes) -> dict:
+    """Вписывает полезную часть в образ на месте метки. Возвращает статистику."""
+    pos = find_factory_blob(bytes(image))
 
     version = image[pos + 16]
     if version != FACTORY_VERSION:
@@ -1403,230 +1434,6 @@ class FlashJob(threading.Thread):
                 False, 0, self.info.size, 0, f"внутренняя ошибка: {e}",
                 time.monotonic() - started)))
 
-
-
-# --------------------------------------------------------------------------
-# OTA: сборка Nordic DFU пакета (zip) из готового .uf2
-# --------------------------------------------------------------------------
-
-DFU_DEVICE_TYPE = 0x0052       # nRF52840
-DFU_DEVICE_REV = 0xFFFF
-DFU_SD_ID = 0x00B6             # SoftDevice S140 6.1.1 — как в прошивках DarkTec
-
-
-
-# --- заводские настройки внутри образа -------------------------------------
-# Метка блока в прошивке (variants/darktec/DarktecFactoryCfg.h). Прошивальщик
-# находит её в образе и вписывает настройки — структура UF2 при этом не
-# меняется: правим байты внутри уже существующих блоков.
-FACTORY_MARKER = b"DARKTEC-FACTORY\x01"
-FACTORY_HEADER = 24            # метка(16) + версия + длина + резерв + crc32
-FACTORY_PAYLOAD = 128
-FACTORY_VERSION = 1
-
-FLAG_NAME = 1 << 0
-FLAG_RADIO = 1 << 1
-FLAG_CAPACITY = 1 << 2
-FLAG_MODULE = 1 << 3
-
-
-def pack_factory_payload(settings: dict) -> tuple[bytes, int]:
-    """Собирает 128-байтовую полезную часть и набор флагов «что применять»."""
-    buf = bytearray(FACTORY_PAYLOAD)
-    flags = 0
-
-    name = (settings.get("name") or "").strip()
-    if name:
-        raw = name.encode("utf-8")[:31]
-        buf[0:len(raw)] = raw
-        flags |= FLAG_NAME
-
-    try:
-        freq = float(settings.get("freq") or 0)
-        bw = float(settings.get("bw") or 0)
-        sf = int(settings.get("sf") or 0)
-        cr = int(settings.get("cr") or 0)
-        tx = int(settings.get("tx") or 0)
-    except (TypeError, ValueError):
-        freq = bw = 0.0
-        sf = cr = tx = 0
-    if freq > 0 and bw > 0 and sf > 0 and cr > 0:
-        struct.pack_into("<ff", buf, 32, freq, bw)
-        buf[40] = sf & 0xFF
-        buf[41] = cr & 0xFF
-        struct.pack_into("<b", buf, 42, max(-9, min(22, tx)))
-        flags |= FLAG_RADIO
-
-    try:
-        cap = int(settings.get("capacity") or 0)
-    except (TypeError, ValueError):
-        cap = 0
-    if 1000 <= cap <= 10000:
-        buf[43] = 0                      # CAP_USER
-        struct.pack_into("<H", buf, 44, cap)
-        flags |= FLAG_CAPACITY
-
-    try:
-        module = int(settings.get("module") or 0)
-    except (TypeError, ValueError):
-        module = 0
-    if 0 <= module <= 3:
-        buf[46] = module & 0xFF
-        flags |= FLAG_MODULE
-
-    buf[51] = flags
-    return bytes(buf), flags
-
-
-def patch_factory_cfg(image: bytearray, payload: bytes) -> dict:
-    """Вписывает полезную часть в образ на месте метки. Возвращает статистику."""
-    pos = image.find(FACTORY_MARKER)
-    if pos < 0:
-        raise Uf2Error("в прошивке нет блока заводских настроек — "
-                       "эта версия не умеет вшивать параметры")
-    if image.find(FACTORY_MARKER, pos + 1) >= 0:
-        raise Uf2Error("метка заводских настроек встречается в образе больше "
-                       "одного раза — патчить нельзя")
-    if pos + FACTORY_HEADER + FACTORY_PAYLOAD > len(image):
-        raise Uf2Error("блок заводских настроек выходит за границу образа")
-
-    version = image[pos + 16]
-    if version != FACTORY_VERSION:
-        raise Uf2Error(f"раскладка блока v{version}, программа знает "
-                       f"только v{FACTORY_VERSION}")
-
-    crc = zlib.crc32(payload) & 0xFFFFFFFF
-    image[pos + 17] = FACTORY_PAYLOAD & 0xFF
-    image[pos + 18] = 0
-    image[pos + 19] = 0
-    struct.pack_into("<I", image, pos + 20, crc)
-    image[pos + FACTORY_HEADER:pos + FACTORY_HEADER + FACTORY_PAYLOAD] = payload
-    return {"offset": pos, "crc": crc, "payload_len": len(payload)}
-
-
-def apply_factory_cfg_to_uf2(src_path: str, dst_path: str,
-                             settings: dict) -> dict:
-    """Копия UF2 с вписанными настройками.
-
-    Патчим НЕ файл, а собранный из него образ: в UF2 данные разложены по 256
-    байт внутри 512-байтовых блоков, и запись «подряд» по смещению в файле
-    разнесла бы блоки. Блоки пересобираются с теми же адресами, размерами и
-    номерами — структура файла не меняется, только байты данных.
-    """
-    payload, flags = pack_factory_payload(settings)
-    image, base, blocks = uf2_to_image(src_path)
-    img = bytearray(image)
-    stats = patch_factory_cfg(img, payload)
-
-    data = bytearray(open(src_path, "rb").read())
-    total = len(data) // UF2_BLOCK
-    for i in range(total):
-        _m0, _m1, _flags, addr, size = struct.unpack_from("<5I", data, i * UF2_BLOCK)
-        off = addr - base
-        if off < 0 or off >= len(img):
-            continue
-        chunk = bytes(img[off:off + size])
-        data[i * UF2_BLOCK + 32:i * UF2_BLOCK + 32 + len(chunk)] = chunk
-
-    tmp = dst_path + ".part"
-    with open(tmp, "wb") as f:
-        f.write(data)
-    os.replace(tmp, dst_path)
-    stats.update({"flags": flags, "size": os.path.getsize(dst_path),
-                  "blocks": total, "base": base, "image": len(img)})
-    return stats
-
-
-def uf2_to_image(path: str) -> tuple[bytes, int, int]:
-    """Склеивает блоки UF2 в непрерывный образ: (данные, базовый адрес, блоков)."""
-    try:
-        size = os.path.getsize(path)
-    except OSError as e:
-        raise Uf2Error(f"не могу открыть файл: {e.strerror or e}") from e
-    if size < UF2_BLOCK or size % UF2_BLOCK:
-        raise Uf2Error("размер не кратен 512 байт — это не UF2")
-    total = size // UF2_BLOCK
-    chunks: dict[int, bytes] = {}
-    base: int | None = None
-    end = 0
-    with open(path, "rb") as f:
-        for idx in range(total):
-            block = f.read(UF2_BLOCK)
-            if len(block) != UF2_BLOCK:
-                raise Uf2Error("файл обрезан")
-            magic0, magic1, _flags, addr, payload = struct.unpack_from("<5I", block, 0)
-            if magic0 != UF2_MAGIC0 or magic1 != UF2_MAGIC1:
-                raise Uf2Error(f"блок {idx}: неверная сигнатура UF2")
-            if payload > UF2_PAYLOAD:
-                payload = UF2_PAYLOAD
-            chunks[addr] = block[32:32 + payload]
-            base = addr if base is None else min(base, addr)
-            end = max(end, addr + payload)
-    if base is None:
-        raise Uf2Error("в файле нет данных")
-    image = bytearray(b"\xff" * (end - base))
-    for addr, data in chunks.items():
-        image[addr - base:addr - base + len(data)] = data
-    return bytes(image), base, total
-
-
-def dfu_crc16(data: bytes) -> int:
-    """CRC-16/CCITT, начальное значение 0xFFFF — так считает adafruit-nrfutil."""
-    crc = 0xFFFF
-    for byte in data:
-        crc ^= byte << 8
-        for _ in range(8):
-            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
-    return crc
-
-
-def build_dfu_zip(uf2_path: str, out_path: str,
-                  app_version: int = 0xFFFFFFFF, progress=None) -> dict:
-    """Собирает OTA-пакет (Nordic DFU zip) из .uf2 и возвращает статистику.
-
-    Внутри: firmware.bin (образ без хвоста 0xFF), firmware.dat (init packet
-    с CRC16) и manifest.json. Формат тот же, что у пакетов из релиза, —
-    его понимает bootloader OTAFIX и приложения Nordic DFU.
-    """
-    image, base, blocks = uf2_to_image(uf2_path)
-    if progress:
-        progress(0.45)
-    image = image.rstrip(b"\xff")          # хвост стирания в пакет не кладём
-    crc = dfu_crc16(image)
-    if progress:
-        progress(0.75)
-
-    init = struct.pack("<HHIH", DFU_DEVICE_TYPE, DFU_DEVICE_REV, app_version, 1)
-    init += struct.pack("<H", DFU_SD_ID)
-    init += struct.pack("<H", crc)
-
-    manifest = {"manifest": {"application": {
-        "bin_file": "firmware.bin",
-        "dat_file": "firmware.dat",
-        "init_packet_data": {
-            "application_version": app_version,
-            "device_revision": DFU_DEVICE_REV,
-            "device_type": DFU_DEVICE_TYPE,
-            "firmware_crc16": crc,
-            "softdevice_req": [DFU_SD_ID],
-        },
-    }, "dfu_version": 0.5}}
-
-    tmp = out_path + ".part"
-    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as z:
-        z.writestr("manifest.json", json.dumps(manifest, indent=4))
-        z.writestr("firmware.dat", init)
-        z.writestr("firmware.bin", image)
-    os.replace(tmp, out_path)
-    if progress:
-        progress(1.0)
-    return {
-        "size": os.path.getsize(out_path),
-        "image": len(image),
-        "base": base,
-        "blocks": blocks,
-        "crc": crc,
-    }
 
 
 # --------------------------------------------------------------------------
