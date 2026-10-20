@@ -833,7 +833,7 @@ class MainWindow(QMainWindow):
                     stats["patch_offset"] = patch["offset"]
                 self.q.put(("ota_done", (True, out, stats)))
             except Exception as e:  # noqa: BLE001
-                self.q.put(("ota_done", (False, str(e), None)))
+                self.q.put(("ota_done", (False, str(e), {"kind": kind})))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -980,8 +980,9 @@ class MainWindow(QMainWindow):
                                      f"{payload}", "file")
                     else:
                         self.set_progress(0)
-                        self.set_status("OTA-пакет не собран")
-                        self.log_msg(f"OTA: {payload}", "err")
+                        word = "UF2" if (stats or {}).get("kind") == "uf2" else "OTA"
+                        self.set_status(f"сборка {word} не удалась — смотри лог")
+                        self.log_msg(f"сборка {word}: {payload}", "err")
                 elif kind == "settings_progress":
                     self.set_progress(ev[1])
                 elif kind == "settings_done":
