@@ -24,8 +24,9 @@ from PyQt6.QtWidgets import (
 import darktec_cfg as cfg
 from DarkFlasher import (
     APP_NAME, APP_VERSION, FlashJob, FlashResult, Uf2Error, Uf2Info,
-    UF2_FAMILY_NRF52840, VolumeWatcher, build_dfu_zip, family_name, fmt_size,
-    scan_uf2_volumes,
+    UF2_FAMILY_NRF52840, VolumeWatcher, apply_factory_cfg_to_uf2,
+    build_dfu_zip_from_image, family_name, fmt_size, pack_factory_payload,
+    patch_factory_cfg, scan_uf2_volumes, uf2_to_image,
 )
 
 STYLE = """
@@ -149,7 +150,7 @@ class MainWindow(QMainWindow):
         self.file_path: str | None = None
         self.firmware: dict[str, str] = {}
         self.busy = False
-        self._pending_ota = False
+        self._pending_action = ""
         self.settings = cfg.load_settings()
         self.role_slug = self.settings.get("role", "companion_radio_ble")
         self._progress = 0
@@ -411,12 +412,21 @@ class MainWindow(QMainWindow):
         self.btn_send.setMinimumHeight(38)
         self.btn_send.clicked.connect(self.send_settings_now)
         btns.addWidget(self.btn_send, 1)
+        root.addLayout(btns)
+
+        btns2 = QHBoxLayout()
+        btns2.setSpacing(8)
+        self.btn_uf2 = QPushButton("Собрать UF2")
+        self.btn_uf2.setObjectName("ota")
+        self.btn_uf2.setMinimumHeight(38)
+        self.btn_uf2.clicked.connect(self.build_uf2)
+        btns2.addWidget(self.btn_uf2, 1)
         self.btn_ota = QPushButton("Собрать OTA-ZIP")
         self.btn_ota.setObjectName("ota")
         self.btn_ota.setMinimumHeight(38)
         self.btn_ota.clicked.connect(self.build_ota)
-        btns.addWidget(self.btn_ota, 1)
-        root.addLayout(btns)
+        btns2.addWidget(self.btn_ota, 1)
+        root.addLayout(btns2)
 
         # log
         log_sec = QLabel("ЛОГ")
@@ -713,9 +723,16 @@ class MainWindow(QMainWindow):
         self.log_msg(f"пишу {fmt_size(self.info.size)} на {vol.title}", "info")
         FlashJob(self.q, self.info, vol).start()
 
-    # ------------------------------------------------------------------- OTA
+    # ------------------------------------------------------- СБОРКА ФАЙЛОВ
+    def build_uf2(self) -> None:
+        """Собирает UF2 с вшитыми настройками."""
+        self._begin_build("uf2")
+
     def build_ota(self) -> None:
-        """Собирает OTA-пакет (Nordic DFU zip) из прошивки для выбранной роли."""
+        """Собирает OTA-пакет (DFU zip) с вшитыми настройками."""
+        self._begin_build("ota")
+
+    def _begin_build(self, kind: str) -> None:
         if self.busy:
             self.log_msg("идёт операция — дождись окончания", "warn")
             return
@@ -735,20 +752,19 @@ class MainWindow(QMainWindow):
                         fresh = False
             if fresh:
                 self._apply_file(local)
-                self._start_ota_build(local, env)
+                self._start_build(local, env, kind)
             else:
-                self._download_and_ota()
+                self._download_and_build(kind)
             return
-        # Релиз не выбран — берём то, что уже лежит в папке firmware.
         if not self.file_path or not os.path.isfile(self.file_path):
             self.rescan_firmware()
         if not self.file_path or not os.path.isfile(self.file_path):
             self.log_msg("нет файла: выбери версию прошивки или положи .uf2 "
                          "в папку firmware", "err")
             return
-        self._start_ota_build(self.file_path, env)
+        self._start_build(self.file_path, env, kind)
 
-    def _download_and_ota(self) -> None:
+    def _download_and_build(self, kind: str) -> None:
         env = self._env()
         rel = self.selected_release
         info = rel["files"].get(env) if rel else None
@@ -757,9 +773,9 @@ class MainWindow(QMainWindow):
                          "в папку firmware", "err")
             return
         self.busy = True
-        self._pending_ota = True
+        self._pending_action = kind
         self.set_progress(0)
-        self.set_status("скачивание прошивки для OTA…")
+        self.set_status("скачивание прошивки…")
         self.log_msg(f"скачиваю {rel['tag']} для «{cfg.role_title(self.role_slug)}»",
                      "info")
 
@@ -774,28 +790,47 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _start_ota_build(self, uf2_path: str, env: str) -> None:
+    def _start_build(self, uf2_path: str, env: str, kind: str) -> None:
         if self.busy:
             return
+        self.busy = True
+        self._pending_action = ""
         stamp = time.strftime("%Y-%m-%d_%H-%M")
         out_dir = os.path.dirname(os.path.abspath(uf2_path)) or cfg.app_dir()
-        out = os.path.join(out_dir, f"{env}-ota-{stamp}.zip")
-        self.busy = True
-        self._pending_ota = False
+        ext = "uf2" if kind == "uf2" else "zip"
+        out = os.path.join(out_dir, f"{env}-{kind}-{stamp}.{ext}")
+        settings = self._collect()
+
         self.set_progress(0.05)
-        self.set_status("собираю OTA-пакет…")
-        self.log_msg(f"OTA: {os.path.basename(uf2_path)}", "ok")
-        self.log_msg("настройки внутрь пакета не попадают — после OTA их "
-                     "писать в ноду отдельно", "dim")
+        self.set_status(f"собираю {ext.upper()} с настройками…")
+        self.log_msg(f"сборка {ext.upper()}: {os.path.basename(uf2_path)}", "ok")
+        self.log_msg(f"параметры: {settings.get('name') or '—'} · "
+                     f"{settings.get('freq')} МГц · SF{settings.get('sf')} · "
+                     f"{settings.get('tx')} дБм · {settings.get('capacity')} мАч",
+                     "dim")
 
         def work() -> None:
             try:
-                self.q.put(("log", "разбираю UF2 по блокам…", "dim"))
-                self.q.put(("ota_progress", 0.15))
-                stats = build_dfu_zip(
-                    uf2_path, out,
-                    progress=lambda p: self.q.put(
-                        ("ota_progress", 0.15 + 0.8 * p)))
+                if kind == "uf2":
+                    self.q.put(("log", "вписываю настройки в образ UF2…", "dim"))
+                    self.q.put(("ota_progress", 0.3))
+                    stats = apply_factory_cfg_to_uf2(uf2_path, out, settings)
+                    stats["kind"] = "uf2"
+                else:
+                    self.q.put(("log", "вписываю настройки в образ…", "dim"))
+                    self.q.put(("ota_progress", 0.25))
+                    image, base, blocks = uf2_to_image(uf2_path)
+                    img = bytearray(image)
+                    payload, _flags = pack_factory_payload(settings)
+                    patch = patch_factory_cfg(img, payload)
+                    self.q.put(("log", f"блок настроек: смещение 0x{patch['offset']:X} · "
+                                       f"crc32 0x{patch['crc']:08X}", "dim"))
+                    self.q.put(("ota_progress", 0.6))
+                    stats = build_dfu_zip_from_image(
+                        bytes(img), out, base=base, blocks=blocks,
+                        progress=lambda p: self.q.put(("ota_progress", 0.6 + 0.35 * p)))
+                    stats["kind"] = "zip"
+                    stats["patch_offset"] = patch["offset"]
                 self.q.put(("ota_done", (True, out, stats)))
             except Exception as e:  # noqa: BLE001
                 self.q.put(("ota_done", (False, str(e), None)))
@@ -903,16 +938,17 @@ class MainWindow(QMainWindow):
                                     f"{mb:.1f} МБ/с")
                 elif kind == "dl_done":
                     self.busy = False
-                    if ev[1] and self._pending_ota:
+                    if ev[1] and self._pending_action in ("uf2", "ota"):
+                        action = self._pending_action
+                        self._pending_action = ""
                         self._apply_file(ev[1])
                         self.set_progress(0.1)
-                        self._start_ota_build(ev[1], self._env())
+                        self._start_build(ev[1], self._env(), action)
                     elif ev[1]:
                         self._apply_file(ev[1])
                         self.set_progress(0.15)
                         self._begin_flash()
                     else:
-                        self._pending_ota = False
                         self.set_progress(0)
                         self.set_status("скачивание не удалось — смотри лог")
                 elif kind == "flash":
@@ -935,11 +971,12 @@ class MainWindow(QMainWindow):
                         self.set_progress(1.0)
                         self.set_status(f"OTA-пакет готов: "
                                         f"{os.path.basename(payload)}")
-                        self.log_msg(f"образ {fmt_size(stats['image'])} · "
+                        self.log_msg(f"образ {fmt_size(stats.get('image', 0))} · "
                                      f"{stats['blocks']} блоков · база "
                                      f"0x{stats['base']:08X} · crc16 "
                                      f"0x{stats['crc']:04X}", "dim")
-                        self.log_msg(f"пакет {fmt_size(stats['size'])} сохранён: "
+                        word = "файл" if stats.get("kind") == "uf2" else "пакет"
+                        self.log_msg(f"{word} {fmt_size(stats['size'])} сохранён: "
                                      f"{payload}", "file")
                     else:
                         self.set_progress(0)

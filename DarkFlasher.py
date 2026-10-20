@@ -37,6 +37,7 @@ import sys
 import threading
 import time
 import zipfile
+import zlib
 from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime
@@ -44,7 +45,7 @@ from datetime import datetime
 import darktec_cfg as cfg
 
 APP_NAME = "Dark Flasher"
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 WINDOW_TITLE = "Dark Flasher — nRF52 UF2"
 
 DEST_NAME = "FW.UF2"          # короткое 8.3-имя: никаких сюрпризов с LFN
@@ -628,6 +629,911 @@ class FlashJob(threading.Thread):
 DFU_DEVICE_TYPE = 0x0052       # nRF52840
 DFU_DEVICE_REV = 0xFFFF
 DFU_SD_ID = 0x00B6             # SoftDevice S140 6.1.1 — как в прошивках DarkTec
+
+
+
+# --- заводские настройки внутри образа -------------------------------------
+# Метка блока в прошивке (variants/darktec/DarktecFactoryCfg.h). Прошивальщик
+# находит её в образе и вписывает настройки — структура UF2 при этом не
+# меняется: правим байты внутри уже существующих блоков.
+FACTORY_MARKER = b"DARKTEC-FACTORY\x01"
+FACTORY_HEADER = 24            # метка(16) + версия + длина + резерв + crc32
+FACTORY_PAYLOAD = 128
+FACTORY_VERSION = 1
+
+FLAG_NAME = 1 << 0
+FLAG_RADIO = 1 << 1
+FLAG_CAPACITY = 1 << 2
+FLAG_MODULE = 1 << 3
+
+
+def pack_factory_payload(settings: dict) -> tuple[bytes, int]:
+    """Собирает 128-байтовую полезную часть и набор флагов «что применять»."""
+    buf = bytearray(FACTORY_PAYLOAD)
+    flags = 0
+
+    name = (settings.get("name") or "").strip()
+    if name:
+        raw = name.encode("utf-8")[:31]
+        buf[0:len(raw)] = raw
+        flags |= FLAG_NAME
+
+    try:
+        freq = float(settings.get("freq") or 0)
+        bw = float(settings.get("bw") or 0)
+        sf = int(settings.get("sf") or 0)
+        cr = int(settings.get("cr") or 0)
+        tx = int(settings.get("tx") or 0)
+    except (TypeError, ValueError):
+        freq = bw = 0.0
+        sf = cr = tx = 0
+    if freq > 0 and bw > 0 and sf > 0 and cr > 0:
+        struct.pack_into("<ff", buf, 32, freq, bw)
+        buf[40] = sf & 0xFF
+        buf[41] = cr & 0xFF
+        struct.pack_into("<b", buf, 42, max(-9, min(22, tx)))
+        flags |= FLAG_RADIO
+
+    try:
+        cap = int(settings.get("capacity") or 0)
+    except (TypeError, ValueError):
+        cap = 0
+    if 1000 <= cap <= 10000:
+        buf[43] = 0                      # CAP_USER
+        struct.pack_into("<H", buf, 44, cap)
+        flags |= FLAG_CAPACITY
+
+    try:
+        module = int(settings.get("module") or 0)
+    except (TypeError, ValueError):
+        module = 0
+    if 0 <= module <= 3:
+        buf[46] = module & 0xFF
+        flags |= FLAG_MODULE
+
+    buf[51] = flags
+    return bytes(buf), flags
+
+
+def patch_factory_cfg(image: bytearray, payload: bytes) -> dict:
+    """Вписывает полезную часть в образ на месте метки. Возвращает статистику."""
+    pos = image.find(FACTORY_MARKER)
+    if pos < 0:
+        raise Uf2Error("в прошивке нет блока заводских настроек — "
+                       "эта версия не умеет вшивать параметры")
+    if image.find(FACTORY_MARKER, pos + 1) >= 0:
+        raise Uf2Error("метка заводских настроек встречается в образе больше "
+                       "одного раза — патчить нельзя")
+    if pos + FACTORY_HEADER + FACTORY_PAYLOAD > len(image):
+        raise Uf2Error("блок заводских настроек выходит за границу образа")
+
+    version = image[pos + 16]
+    if version != FACTORY_VERSION:
+        raise Uf2Error(f"раскладка блока v{version}, программа знает "
+                       f"только v{FACTORY_VERSION}")
+
+    crc = zlib.crc32(payload) & 0xFFFFFFFF
+    image[pos + 17] = FACTORY_PAYLOAD & 0xFF
+    image[pos + 18] = 0
+    image[pos + 19] = 0
+    struct.pack_into("<I", image, pos + 20, crc)
+    image[pos + FACTORY_HEADER:pos + FACTORY_HEADER + FACTORY_PAYLOAD] = payload
+    return {"offset": pos, "crc": crc, "payload_len": len(payload)}
+
+
+def apply_factory_cfg_to_uf2(src_path: str, dst_path: str,
+                             settings: dict) -> dict:
+    """Копия UF2 с вписанными настройками.
+
+    Патчим НЕ файл, а собранный из него образ: в UF2 данные разложены по 256
+    байт внутри 512-байтовых блоков, и запись «подряд» по смещению в файле
+    разнесла бы блоки. Блоки пересобираются с теми же адресами, размерами и
+    номерами — структура файла не меняется, только байты данных.
+    """
+    payload, flags = pack_factory_payload(settings)
+    image, base, blocks = uf2_to_image(src_path)
+    img = bytearray(image)
+    stats = patch_factory_cfg(img, payload)
+
+    data = bytearray(open(src_path, "rb").read())
+    total = len(data) // UF2_BLOCK
+    for i in range(total):
+        _m0, _m1, _flags, addr, size = struct.unpack_from("<5I", data, i * UF2_BLOCK)
+        off = addr - base
+        if off < 0 or off >= len(img):
+            continue
+        chunk = bytes(img[off:off + size])
+        data[i * UF2_BLOCK + 32:i * UF2_BLOCK + 32 + len(chunk)] = chunk
+
+    tmp = dst_path + ".part"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, dst_path)
+    stats.update({"flags": flags, "size": os.path.getsize(dst_path),
+                  "blocks": total, "base": base, "image": len(img)})
+    return stats
+
+
+def uf2_to_image(path: str) -> tuple[bytes, int, int]:
+    """Склеивает блоки UF2 в непрерывный образ: (данные, базовый адрес, блоков)."""
+    try:
+        size = os.path.getsize(path)
+    except OSError as e:
+        raise Uf2Error(f"не могу открыть файл: {e.strerror or e}") from e
+    if size < UF2_BLOCK or size % UF2_BLOCK:
+        raise Uf2Error("размер не кратен 512 байт — это не UF2")
+    total = size // UF2_BLOCK
+    chunks: dict[int, bytes] = {}
+    base: int | None = None
+    end = 0
+    with open(path, "rb") as f:
+        for idx in range(total):
+            block = f.read(UF2_BLOCK)
+            if len(block) != UF2_BLOCK:
+                raise Uf2Error("файл обрезан")
+            magic0, magic1, _flags, addr, payload = struct.unpack_from("<5I", block, 0)
+            if magic0 != UF2_MAGIC0 or magic1 != UF2_MAGIC1:
+                raise Uf2Error(f"блок {idx}: неверная сигнатура UF2")
+            if payload > UF2_PAYLOAD:
+                payload = UF2_PAYLOAD
+            chunks[addr] = block[32:32 + payload]
+            base = addr if base is None else min(base, addr)
+            end = max(end, addr + payload)
+    if base is None:
+        raise Uf2Error("в файле нет данных")
+    image = bytearray(b"\xff" * (end - base))
+    for addr, data in chunks.items():
+        image[addr - base:addr - base + len(data)] = data
+    return bytes(image), base, total
+
+
+def dfu_crc16(data: bytes) -> int:
+    """CRC-16/CCITT, начальное значение 0xFFFF — так считает adafruit-nrfutil."""
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    return crc
+
+
+def build_dfu_zip_from_image(image: bytes, out_path: str,
+                             app_version: int = 0xFFFFFFFF,
+                             base: int = 0, blocks: int = 0,
+                             progress=None) -> dict:
+    """Собирает Nordic DFU пакет из готового образа (bytes)."""
+    if progress:
+        progress(0.45)
+    image = image.rstrip(b"\xff")          # хвост стирания в пакет не кладём
+    crc = dfu_crc16(image)
+    if progress:
+        progress(0.75)
+
+    init = struct.pack("<HHIH", DFU_DEVICE_TYPE, DFU_DEVICE_REV, app_version, 1)
+    init += struct.pack("<H", DFU_SD_ID)
+    init += struct.pack("<H", crc)
+
+    manifest = {"manifest": {"application": {
+        "bin_file": "firmware.bin",
+        "dat_file": "firmware.dat",
+        "init_packet_data": {
+            "application_version": app_version,
+            "device_revision": DFU_DEVICE_REV,
+            "device_type": DFU_DEVICE_TYPE,
+            "firmware_crc16": crc,
+            "softdevice_req": [DFU_SD_ID],
+        },
+    }, "dfu_version": 0.5}}
+
+    tmp = out_path + ".part"
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as z:
+        z.writestr("manifest.json", json.dumps(manifest, indent=4))
+        z.writestr("firmware.dat", init)
+        z.writestr("firmware.bin", image)
+    os.replace(tmp, out_path)
+    if progress:
+        progress(1.0)
+    return {"size": os.path.getsize(out_path), "image": len(image),
+            "base": base, "blocks": blocks, "crc": crc}
+
+
+def build_dfu_zip(uf2_path: str, out_path: str,
+                  app_version: int = 0xFFFFFFFF, progress=None) -> dict:
+    """Собирает OTA-пакет (Nordic DFU zip) из .uf2."""
+    image, base, blocks = uf2_to_image(uf2_path)
+    return build_dfu_zip_from_image(image, out_path, app_version=app_version,
+                                    base=base, blocks=blocks, progress=progress)
+
+
+# --------------------------------------------------------------------------
+# Win32
+# --------------------------------------------------------------------------
+
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
+
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+GENERIC_WRITE = 0x40000000
+FILE_SHARE_READ = 0x00000001
+FILE_SHARE_WRITE = 0x00000002
+CREATE_ALWAYS = 2
+FILE_ATTRIBUTE_NORMAL = 0x00000080
+FILE_FLAG_WRITE_THROUGH = 0x80000000
+FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000
+DRIVE_REMOVABLE = 2
+
+WM_DROPFILES = 0x0233
+GWLP_WNDPROC = -4
+WNDPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, ctypes.c_size_t, ctypes.c_ssize_t
+)
+
+
+def _init_win32() -> None:
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    kernel32.WriteFile.restype = wintypes.BOOL
+    kernel32.WriteFile.argtypes = [
+        wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
+    ]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    kernel32.FindFirstVolumeW.restype = wintypes.HANDLE
+    kernel32.FindFirstVolumeW.argtypes = [wintypes.LPWSTR, wintypes.DWORD]
+    kernel32.FindNextVolumeW.restype = wintypes.BOOL
+    kernel32.FindNextVolumeW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD]
+    kernel32.FindVolumeClose.restype = wintypes.BOOL
+    kernel32.FindVolumeClose.argtypes = [wintypes.HANDLE]
+
+    kernel32.GetDriveTypeW.restype = wintypes.UINT
+    kernel32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
+    kernel32.GetVolumePathNamesForVolumeNameW.restype = wintypes.BOOL
+    kernel32.GetVolumePathNamesForVolumeNameW.argtypes = [
+        wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.GetVolumeInformationW.restype = wintypes.BOOL
+    kernel32.GetVolumeInformationW.argtypes = [
+        wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD), wintypes.LPWSTR, wintypes.DWORD,
+    ]
+    kernel32.GetDiskFreeSpaceExW.restype = wintypes.BOOL
+    kernel32.GetDiskFreeSpaceExW.argtypes = [
+        wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_ulonglong),
+        ctypes.POINTER(ctypes.c_ulonglong), ctypes.POINTER(ctypes.c_ulonglong),
+    ]
+
+    user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+    user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+    user32.CallWindowProcW.restype = ctypes.c_ssize_t
+    user32.CallWindowProcW.argtypes = [
+        ctypes.c_void_p, wintypes.HWND, wintypes.UINT, ctypes.c_size_t, ctypes.c_ssize_t,
+    ]
+    user32.GetParent.restype = wintypes.HWND
+    user32.GetParent.argtypes = [wintypes.HWND]
+    user32.GetDpiForSystem.restype = wintypes.UINT
+    user32.GetDpiForSystem.argtypes = []
+
+    shell32.DragAcceptFiles.restype = None
+    shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
+    shell32.DragQueryFileW.restype = wintypes.UINT
+    shell32.DragQueryFileW.argtypes = [wintypes.HANDLE, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT]
+    shell32.DragFinish.restype = None
+    shell32.DragFinish.argtypes = [wintypes.HANDLE]
+
+    dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
+    dwmapi.DwmSetWindowAttribute.argtypes = [
+        wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+    ]
+
+
+_init_win32()
+
+WINERROR_RU = {
+    2: "том или файл не найден (плата отключилась?)",
+    3: "путь не найден",
+    5: "доступ запрещён — том занят антивирусом или другой программой",
+    19: "том защищён от записи",
+    21: "устройство не готово",
+    23: "ошибка данных (плохой кабель/питание?)",
+    31: "общая ошибка устройства",
+    32: "файл занят другим процессом",
+    33: "том занят другим процессом",
+    34: "Windows потерял том — плата перезагрузилась",
+    39: "том занят",
+    87: "неверный параметр",
+    112: "на томе нет места",
+    121: "таймаут операции (устройство не отвечает)",
+    1167: "устройство отключено",
+    1231: "сеть недоступна",
+}
+
+
+def winerror_text(code: int) -> str:
+    if code in WINERROR_RU:
+        return WINERROR_RU[code]
+    try:
+        return ctypes.FormatError(code).strip() or f"ошибка {code}"
+    except Exception:
+        return f"ошибка {code}"
+
+
+# --------------------------------------------------------------------------
+# UF2
+# --------------------------------------------------------------------------
+
+class Uf2Error(Exception):
+    pass
+
+
+def family_name(family: int) -> str:
+    if family == UF2_FAMILY_NRF52840:
+        return "nRF52840"
+    return f"family 0x{family:08X}"
+
+
+@dataclass
+class Uf2Info:
+    path: str
+    size: int
+    num_blocks: int
+    family: int
+    base_addr: int
+    data_bytes: int
+    magic_end: int
+
+    @classmethod
+    def load(cls, path: str) -> "Uf2Info":
+        try:
+            size = os.path.getsize(path)
+        except OSError as e:
+            raise Uf2Error(f"не могу открыть файл: {e.strerror or e}") from e
+        if size < UF2_BLOCK or size % UF2_BLOCK:
+            raise Uf2Error("размер не кратен 512 байт — это не UF2")
+
+        num = size // UF2_BLOCK
+        seen = bytearray(num)
+        family = None
+        base = None
+        magic_end = None
+        with open(path, "rb") as f:
+            for idx in range(num):
+                block = f.read(UF2_BLOCK)
+                if len(block) != UF2_BLOCK:
+                    raise Uf2Error("файл обрезан")
+                magic0, magic1, _flags, addr, payload, block_no, total, fam = \
+                    struct.unpack_from("<8I", block, 0)
+                block_magic_end, = struct.unpack_from("<I", block, 508)
+                if magic0 != UF2_MAGIC0 or magic1 != UF2_MAGIC1:
+                    raise Uf2Error(f"блок {idx}: неверная сигнатура UF2 — файл битый")
+                if block_magic_end not in UF2_MAGIC_ENDS:
+                    raise Uf2Error(
+                        f"блок {idx}: незнакомый UF2_MAGIC_END 0x{block_magic_end:08X}"
+                    )
+                if magic_end is None:
+                    magic_end = block_magic_end
+                elif block_magic_end != magic_end:
+                    raise Uf2Error("в файле смешаны разные варианты UF2")
+                if payload != UF2_PAYLOAD:
+                    raise Uf2Error(f"блок {idx}: неожиданный размер данных")
+                if total != num:
+                    raise Uf2Error(
+                        f"файл неполный: внутри заявлено {total} блоков, а лежит {num}"
+                    )
+                if block_no >= num:
+                    raise Uf2Error(f"блок {idx}: номер {block_no} вне файла")
+                if seen[block_no]:
+                    raise Uf2Error(f"блок {block_no} встречается дважды")
+                seen[block_no] = 1
+                if family is None:
+                    family = fam
+                elif fam != family:
+                    raise Uf2Error("в файле смешаны разные family ID")
+                if base is None:
+                    base = addr
+                elif addr != base + block_no * UF2_PAYLOAD:
+                    raise Uf2Error("блоки идут не подряд — это не обычная прошивка")
+
+        if family is None or family == 0:
+            raise Uf2Error("в UF2 нет family ID — не понимаю, для какого это чипа")
+        if len(seen) != num:
+            raise Uf2Error("файл неполный: не хватает блоков")
+
+        return cls(path=path, size=size, num_blocks=num, family=family,
+                   base_addr=base or 0, data_bytes=num * UF2_PAYLOAD,
+                   magic_end=magic_end or UF2_MAGIC_END_STD)
+
+
+# --------------------------------------------------------------------------
+# Тома
+# --------------------------------------------------------------------------
+
+def list_volume_guids() -> list[str]:
+    out: list[str] = []
+    buf = ctypes.create_unicode_buffer(1024)
+    handle = kernel32.FindFirstVolumeW(buf, 1024)
+    if not handle or handle == INVALID_HANDLE_VALUE:
+        return out
+    try:
+        while True:
+            out.append(buf.value)
+            if not kernel32.FindNextVolumeW(handle, buf, 1024):
+                break
+    finally:
+        kernel32.FindVolumeClose(handle)
+    return out
+
+
+def volume_letter(guid: str) -> str:
+    buf = ctypes.create_unicode_buffer(1024)
+    needed = wintypes.DWORD(0)
+    if kernel32.GetVolumePathNamesForVolumeNameW(guid, buf, 1024, ctypes.byref(needed)):
+        first = buf.value
+        if first:
+            return first.rstrip("\\")
+    return ""
+
+
+def volume_label(guid: str) -> str:
+    buf = ctypes.create_unicode_buffer(256)
+    fs = ctypes.create_unicode_buffer(64)
+    serial = wintypes.DWORD(0)
+    maxlen = wintypes.DWORD(0)
+    flags = wintypes.DWORD(0)
+    if kernel32.GetVolumeInformationW(
+        guid, buf, 256, ctypes.byref(serial), ctypes.byref(maxlen),
+        ctypes.byref(flags), fs, 64,
+    ):
+        return buf.value
+    return ""
+
+
+def volume_free(guid: str) -> int:
+    free = ctypes.c_ulonglong(0)
+    total = ctypes.c_ulonglong(0)
+    total_free = ctypes.c_ulonglong(0)
+    if kernel32.GetDiskFreeSpaceExW(
+        guid, ctypes.byref(free), ctypes.byref(total), ctypes.byref(total_free)
+    ):
+        return int(free.value)
+    return 0
+
+
+def read_info_uf2(path: str) -> str | None:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read(8192)
+    except OSError:
+        return None
+
+
+@dataclass(frozen=True)
+class Uf2Volume:
+    path: str
+    letter: str
+    label: str
+    model: str
+    board_id: str
+    bootloader: str
+    free: int
+
+    @property
+    def title(self) -> str:
+        return self.model or self.label or "UF2"
+
+    @property
+    def where(self) -> str:
+        return self.letter or "?"
+
+
+def probe_uf2_volume(guid: str) -> Uf2Volume | None:
+    text = read_info_uf2(guid + "INFO_UF2.TXT")
+    if not text or "UF2" not in text.upper():
+        return None
+    model = ""
+    board_id = ""
+    bootloader = ""
+    for line in text.splitlines():
+        line = line.strip()
+        low = line.lower()
+        if low.startswith("uf2 bootloader"):
+            bootloader = line[len("UF2 Bootloader"):].strip() or line
+        elif low.startswith("model:"):
+            model = line.split(":", 1)[1].strip()
+        elif low.startswith("board-id:"):
+            board_id = line.split(":", 1)[1].strip()
+    return Uf2Volume(
+        path=guid,
+        letter=volume_letter(guid),
+        label=volume_label(guid),
+        model=model,
+        board_id=board_id,
+        bootloader=bootloader,
+        free=volume_free(guid),
+    )
+
+
+def scan_uf2_volumes() -> list[Uf2Volume]:
+    found: list[Uf2Volume] = []
+    for guid in list_volume_guids():
+        vol = probe_uf2_volume(guid)
+        if vol is not None:
+            found.append(vol)
+    return found
+
+
+def volume_present(guid: str) -> bool:
+    return guid in list_volume_guids()
+
+
+def wait_volume_gone(guid: str, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not volume_present(guid):
+            return True
+        time.sleep(0.12)
+    return False
+
+
+# --------------------------------------------------------------------------
+# Запись
+# --------------------------------------------------------------------------
+
+@dataclass
+class FlashResult:
+    ok: bool
+    written: int
+    total: int
+    winerror: int
+    message: str
+    elapsed: float
+    last_block_ok: bool = True
+    rebooted: bool = False
+    cancelled: bool = False
+    no_volume: bool = False
+
+    @property
+    def percent(self) -> int:
+        return int(self.written * 100 / self.total) if self.total else 0
+
+
+def _write_all(handle, data: bytes, progress, base: int, total: int) -> tuple[int, int]:
+    buf = ctypes.create_string_buffer(data, len(data))
+    offset = 0
+    size = len(data)
+    while offset < size:
+        written = wintypes.DWORD(0)
+        ok = kernel32.WriteFile(
+            handle, ctypes.byref(buf, offset), size - offset,
+            ctypes.byref(written), None,
+        )
+        if not ok:
+            return offset + int(written.value), ctypes.get_last_error()
+        if written.value == 0:
+            return offset, 31
+        offset += int(written.value)
+        if progress is not None:
+            progress(base + offset, total)
+    return offset, 0
+
+
+def write_uf2(vol_path: str, src_path: str, total: int,
+              progress=None, cancelled=None) -> FlashResult:
+    """
+    Пишет файл на том. Последний 512-байтный блок — отдельным WriteFile:
+    если связь оборвалась ровно на нём, это значит, что загрузчик принял
+    последний блок и ушёл в ребут (а не что запись провалилась).
+    """
+    started = time.monotonic()
+    dest = vol_path + DEST_NAME
+    handle = kernel32.CreateFileW(
+        dest, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, None,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH | FILE_FLAG_SEQUENTIAL_SCAN,
+        None,
+    )
+    if not handle or handle == INVALID_HANDLE_VALUE:
+        code = ctypes.get_last_error()
+        return FlashResult(False, 0, total, code, winerror_text(code),
+                           time.monotonic() - started)
+
+    written = 0
+    err = 0
+    last_ok = True
+    body = max(0, total - UF2_BLOCK)
+    try:
+        with open(src_path, "rb") as f:
+            remaining = body
+            while remaining > 0:
+                if cancelled is not None and cancelled():
+                    return FlashResult(False, written, total, 0, "отменено",
+                                       time.monotonic() - started, cancelled=True)
+                chunk = f.read(min(CHUNK_SIZE, remaining))
+                if not chunk:
+                    err = 31
+                    break
+                got, code = _write_all(handle, chunk, progress, written, total)
+                written += got
+                if code:
+                    err = code
+                    break
+                remaining -= got
+            if err == 0:
+                tail = f.read(UF2_BLOCK)
+                if len(tail) == UF2_BLOCK:
+                    got, code = _write_all(handle, tail, progress, written, total)
+                    written += got
+                    if code:
+                        err = code
+                        last_ok = False
+                else:
+                    err = 31
+    finally:
+        # После ребута CloseHandle может вернуть ошибку — это нормально.
+        kernel32.CloseHandle(handle)
+
+    elapsed = time.monotonic() - started
+    ok = err == 0 and written == total
+    if ok:
+        message = "готово"
+    elif err:
+        message = winerror_text(err)
+    else:
+        message = "записано не всё"
+    return FlashResult(ok, written, total, err, message, elapsed, last_block_ok=last_ok)
+
+
+# --------------------------------------------------------------------------
+# Фоновые потоки
+# --------------------------------------------------------------------------
+
+class VolumeWatcher(threading.Thread):
+    """Каждые 250 мс смотрит, есть ли UF2-том. UI обновляется через очередь."""
+
+    def __init__(self, q: queue.Queue, interval: float = 0.25):
+        super().__init__(name="volume-watcher", daemon=True)
+        self.q = q
+        self.interval = interval
+        self._stop = threading.Event()
+        self._pause = threading.Event()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def pause(self) -> None:
+        self._pause.set()
+
+    def resume(self) -> None:
+        self._pause.clear()
+
+    def run(self) -> None:
+        last: tuple | None = None
+        while not self._stop.is_set():
+            if self._pause.is_set():
+                self._stop.wait(0.1)
+                continue
+            try:
+                vols = scan_uf2_volumes()
+            except Exception:
+                vols = []
+            signature = tuple((v.path, v.model, v.board_id) for v in vols)
+            if signature != last:
+                last = signature
+                self.q.put(("volumes", vols))
+            self._stop.wait(self.interval)
+
+
+class FlashJob(threading.Thread):
+    def __init__(self, q: queue.Queue, info: Uf2Info, volume: Uf2Volume):
+        super().__init__(name="flash-job", daemon=True)
+        self.q = q
+        self.info = info
+        self.volume = volume
+
+    def _resolve_volume(self) -> Uf2Volume | None:
+        vols = scan_uf2_volumes()
+        if not vols:
+            return None
+        for v in vols:
+            if v.path == self.volume.path:
+                return v
+        same = [v for v in vols if v.board_id and v.board_id == self.volume.board_id]
+        if len(same) == 1:
+            return same[0]
+        if len(vols) == 1:
+            return vols[0]
+        return None
+
+    def run(self) -> None:
+        started = time.monotonic()
+        try:
+            vol = self._resolve_volume()
+            if vol is None:
+                self.q.put(("flash", FlashResult(
+                    False, 0, self.info.size, 0,
+                    "плата не в режиме загрузчика", time.monotonic() - started,
+                    no_volume=True)))
+                return
+            if vol.path != self.volume.path:
+                self.q.put(("log", f"том переподключился: {vol.where}", "warn"))
+            res = write_uf2(
+                vol.path, self.info.path, self.info.size,
+                progress=lambda done, total: self.q.put(("progress", done, total)),
+            )
+            res.elapsed = time.monotonic() - started
+
+            if res.written >= self.info.size - UF2_BLOCK:
+                self.q.put(("log", "файл записан, жду перезагрузку платы…", "info"))
+                self.q.put(("status", "файл записан, жду перезагрузку платы…"))
+                gone = wait_volume_gone(vol.path, REBOOT_WAIT)
+                res.rebooted = gone
+                if gone:
+                    res.ok = True
+                    if res.written < self.info.size:
+                        res.message = "последний блок ушёл в момент ребута"
+                    else:
+                        res.message = "готово"
+                else:
+                    res.ok = res.written == self.info.size
+                    if res.ok:
+                        res.message = "записано, но плата не перезагрузилась"
+                    else:
+                        res.message = "последний блок не записался"
+            else:
+                res.ok = False
+                gone = not volume_present(vol.path)
+                if res.written == 0 and gone:
+                    res.no_volume = True
+                    res.message = "плата исчезла до начала записи"
+                elif gone:
+                    res.message = f"обрыв на {res.percent}% — тома уже нет"
+                elif not res.message:
+                    res.message = "запись прервалась"
+            self.q.put(("flash", res))
+        except Exception as e:  # noqa: BLE001 — поток не должен падать молча
+            self.q.put(("flash", FlashResult(
+                False, 0, self.info.size, 0, f"внутренняя ошибка: {e}",
+                time.monotonic() - started)))
+
+
+
+# --------------------------------------------------------------------------
+# OTA: сборка Nordic DFU пакета (zip) из готового .uf2
+# --------------------------------------------------------------------------
+
+DFU_DEVICE_TYPE = 0x0052       # nRF52840
+DFU_DEVICE_REV = 0xFFFF
+DFU_SD_ID = 0x00B6             # SoftDevice S140 6.1.1 — как в прошивках DarkTec
+
+
+
+# --- заводские настройки внутри образа -------------------------------------
+# Метка блока в прошивке (variants/darktec/DarktecFactoryCfg.h). Прошивальщик
+# находит её в образе и вписывает настройки — структура UF2 при этом не
+# меняется: правим байты внутри уже существующих блоков.
+FACTORY_MARKER = b"DARKTEC-FACTORY\x01"
+FACTORY_HEADER = 24            # метка(16) + версия + длина + резерв + crc32
+FACTORY_PAYLOAD = 128
+FACTORY_VERSION = 1
+
+FLAG_NAME = 1 << 0
+FLAG_RADIO = 1 << 1
+FLAG_CAPACITY = 1 << 2
+FLAG_MODULE = 1 << 3
+
+
+def pack_factory_payload(settings: dict) -> tuple[bytes, int]:
+    """Собирает 128-байтовую полезную часть и набор флагов «что применять»."""
+    buf = bytearray(FACTORY_PAYLOAD)
+    flags = 0
+
+    name = (settings.get("name") or "").strip()
+    if name:
+        raw = name.encode("utf-8")[:31]
+        buf[0:len(raw)] = raw
+        flags |= FLAG_NAME
+
+    try:
+        freq = float(settings.get("freq") or 0)
+        bw = float(settings.get("bw") or 0)
+        sf = int(settings.get("sf") or 0)
+        cr = int(settings.get("cr") or 0)
+        tx = int(settings.get("tx") or 0)
+    except (TypeError, ValueError):
+        freq = bw = 0.0
+        sf = cr = tx = 0
+    if freq > 0 and bw > 0 and sf > 0 and cr > 0:
+        struct.pack_into("<ff", buf, 32, freq, bw)
+        buf[40] = sf & 0xFF
+        buf[41] = cr & 0xFF
+        struct.pack_into("<b", buf, 42, max(-9, min(22, tx)))
+        flags |= FLAG_RADIO
+
+    try:
+        cap = int(settings.get("capacity") or 0)
+    except (TypeError, ValueError):
+        cap = 0
+    if 1000 <= cap <= 10000:
+        buf[43] = 0                      # CAP_USER
+        struct.pack_into("<H", buf, 44, cap)
+        flags |= FLAG_CAPACITY
+
+    try:
+        module = int(settings.get("module") or 0)
+    except (TypeError, ValueError):
+        module = 0
+    if 0 <= module <= 3:
+        buf[46] = module & 0xFF
+        flags |= FLAG_MODULE
+
+    buf[51] = flags
+    return bytes(buf), flags
+
+
+def patch_factory_cfg(image: bytearray, payload: bytes) -> dict:
+    """Вписывает полезную часть в образ на месте метки. Возвращает статистику."""
+    pos = image.find(FACTORY_MARKER)
+    if pos < 0:
+        raise Uf2Error("в прошивке нет блока заводских настроек — "
+                       "эта версия не умеет вшивать параметры")
+    if image.find(FACTORY_MARKER, pos + 1) >= 0:
+        raise Uf2Error("метка заводских настроек встречается в образе больше "
+                       "одного раза — патчить нельзя")
+    if pos + FACTORY_HEADER + FACTORY_PAYLOAD > len(image):
+        raise Uf2Error("блок заводских настроек выходит за границу образа")
+
+    version = image[pos + 16]
+    if version != FACTORY_VERSION:
+        raise Uf2Error(f"раскладка блока v{version}, программа знает "
+                       f"только v{FACTORY_VERSION}")
+
+    crc = zlib.crc32(payload) & 0xFFFFFFFF
+    image[pos + 17] = FACTORY_PAYLOAD & 0xFF
+    image[pos + 18] = 0
+    image[pos + 19] = 0
+    struct.pack_into("<I", image, pos + 20, crc)
+    image[pos + FACTORY_HEADER:pos + FACTORY_HEADER + FACTORY_PAYLOAD] = payload
+    return {"offset": pos, "crc": crc, "payload_len": len(payload)}
+
+
+def apply_factory_cfg_to_uf2(src_path: str, dst_path: str,
+                             settings: dict) -> dict:
+    """Копия UF2 с вписанными настройками.
+
+    Патчим НЕ файл, а собранный из него образ: в UF2 данные разложены по 256
+    байт внутри 512-байтовых блоков, и запись «подряд» по смещению в файле
+    разнесла бы блоки. Блоки пересобираются с теми же адресами, размерами и
+    номерами — структура файла не меняется, только байты данных.
+    """
+    payload, flags = pack_factory_payload(settings)
+    image, base, blocks = uf2_to_image(src_path)
+    img = bytearray(image)
+    stats = patch_factory_cfg(img, payload)
+
+    data = bytearray(open(src_path, "rb").read())
+    total = len(data) // UF2_BLOCK
+    for i in range(total):
+        _m0, _m1, _flags, addr, size = struct.unpack_from("<5I", data, i * UF2_BLOCK)
+        off = addr - base
+        if off < 0 or off >= len(img):
+            continue
+        chunk = bytes(img[off:off + size])
+        data[i * UF2_BLOCK + 32:i * UF2_BLOCK + 32 + len(chunk)] = chunk
+
+    tmp = dst_path + ".part"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, dst_path)
+    stats.update({"flags": flags, "size": os.path.getsize(dst_path),
+                  "blocks": total, "base": base, "image": len(img)})
+    return stats
 
 
 def uf2_to_image(path: str) -> tuple[bytes, int, int]:
