@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import json
 import math
 import os
 import queue
@@ -35,6 +36,7 @@ import struct
 import sys
 import threading
 import time
+import zipfile
 from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime
@@ -42,7 +44,7 @@ from datetime import datetime
 import darktec_cfg as cfg
 
 APP_NAME = "Dark Flasher"
-APP_VERSION = "1.1"
+APP_VERSION = "1.2"
 WINDOW_TITLE = "Dark Flasher — nRF52 UF2"
 
 DEST_NAME = "FW.UF2"          # короткое 8.3-имя: никаких сюрпризов с LFN
@@ -618,6 +620,108 @@ class FlashJob(threading.Thread):
                 time.monotonic() - started)))
 
 
+
+# --------------------------------------------------------------------------
+# OTA: сборка Nordic DFU пакета (zip) из готового .uf2
+# --------------------------------------------------------------------------
+
+DFU_DEVICE_TYPE = 0x0052       # nRF52840
+DFU_DEVICE_REV = 0xFFFF
+DFU_SD_ID = 0x00B6             # SoftDevice S140 6.1.1 — как в прошивках DarkTec
+
+
+def uf2_to_image(path: str) -> tuple[bytes, int, int]:
+    """Склеивает блоки UF2 в непрерывный образ: (данные, базовый адрес, блоков)."""
+    try:
+        size = os.path.getsize(path)
+    except OSError as e:
+        raise Uf2Error(f"не могу открыть файл: {e.strerror or e}") from e
+    if size < UF2_BLOCK or size % UF2_BLOCK:
+        raise Uf2Error("размер не кратен 512 байт — это не UF2")
+    total = size // UF2_BLOCK
+    chunks: dict[int, bytes] = {}
+    base: int | None = None
+    end = 0
+    with open(path, "rb") as f:
+        for idx in range(total):
+            block = f.read(UF2_BLOCK)
+            if len(block) != UF2_BLOCK:
+                raise Uf2Error("файл обрезан")
+            magic0, magic1, _flags, addr, payload = struct.unpack_from("<5I", block, 0)
+            if magic0 != UF2_MAGIC0 or magic1 != UF2_MAGIC1:
+                raise Uf2Error(f"блок {idx}: неверная сигнатура UF2")
+            if payload > UF2_PAYLOAD:
+                payload = UF2_PAYLOAD
+            chunks[addr] = block[32:32 + payload]
+            base = addr if base is None else min(base, addr)
+            end = max(end, addr + payload)
+    if base is None:
+        raise Uf2Error("в файле нет данных")
+    image = bytearray(b"\xff" * (end - base))
+    for addr, data in chunks.items():
+        image[addr - base:addr - base + len(data)] = data
+    return bytes(image), base, total
+
+
+def dfu_crc16(data: bytes) -> int:
+    """CRC-16/CCITT, начальное значение 0xFFFF — так считает adafruit-nrfutil."""
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    return crc
+
+
+def build_dfu_zip(uf2_path: str, out_path: str,
+                  app_version: int = 0xFFFFFFFF, progress=None) -> dict:
+    """Собирает OTA-пакет (Nordic DFU zip) из .uf2 и возвращает статистику.
+
+    Внутри: firmware.bin (образ без хвоста 0xFF), firmware.dat (init packet
+    с CRC16) и manifest.json. Формат тот же, что у пакетов из релиза, —
+    его понимает bootloader OTAFIX и приложения Nordic DFU.
+    """
+    image, base, blocks = uf2_to_image(uf2_path)
+    if progress:
+        progress(0.45)
+    image = image.rstrip(b"\xff")          # хвост стирания в пакет не кладём
+    crc = dfu_crc16(image)
+    if progress:
+        progress(0.75)
+
+    init = struct.pack("<HHIH", DFU_DEVICE_TYPE, DFU_DEVICE_REV, app_version, 1)
+    init += struct.pack("<H", DFU_SD_ID)
+    init += struct.pack("<H", crc)
+
+    manifest = {"manifest": {"application": {
+        "bin_file": "firmware.bin",
+        "dat_file": "firmware.dat",
+        "init_packet_data": {
+            "application_version": app_version,
+            "device_revision": DFU_DEVICE_REV,
+            "device_type": DFU_DEVICE_TYPE,
+            "firmware_crc16": crc,
+            "softdevice_req": [DFU_SD_ID],
+        },
+    }, "dfu_version": 0.5}}
+
+    tmp = out_path + ".part"
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as z:
+        z.writestr("manifest.json", json.dumps(manifest, indent=4))
+        z.writestr("firmware.dat", init)
+        z.writestr("firmware.bin", image)
+    os.replace(tmp, out_path)
+    if progress:
+        progress(1.0)
+    return {
+        "size": os.path.getsize(out_path),
+        "image": len(image),
+        "base": base,
+        "blocks": blocks,
+        "crc": crc,
+    }
+
+
 # --------------------------------------------------------------------------
 # Оформление
 # --------------------------------------------------------------------------
@@ -638,6 +742,9 @@ ERR = "#d96a6a"
 ERR_DARK = "#6e2f35"
 BLUE = "#6cb6ff"
 BLUE_DARK = "#1d3a5f"
+OTA = "#d9863a"          # оранжевый: кнопка сборки OTA-пакета
+OTA_DARK = "#7a4a17"
+OTA_TXT = "#1b1108"
 
 # ------------------------------- geometry ---------------------------------
 S = 1.0  # DPI scale, ставится в launch_gui()
@@ -732,6 +839,7 @@ class App:
         self.progress = 0.0
         self.busy = False
         self.status_text = ""
+        self._status_hold_until = 0.0
         self.last_error = ""
         self._pulse_on = False
         self._pulse_job = None
@@ -901,9 +1009,11 @@ class App:
             x=X(400), y=X(456), width=X(346), height=X(24))
 
         self._mk_btn(root, "ПРОШИТЬ", self.flash_current,
-                     X(24), X(494), X(348), X(34), ACCENT_DARK, TEXT)
+                     X(24), X(494), X(232), X(34), ACCENT_DARK, TEXT)
         self._mk_btn(root, "Отправить настройки", self.send_settings_now,
-                     X(384), X(494), X(372), X(34))
+                     X(268), X(494), X(240), X(34))
+        self._mk_btn(root, "Собрать OTA-ZIP", self.build_ota,
+                     X(520), X(494), X(236), X(34), OTA, OTA_TXT)
 
         # divider + log ----------------------------------------------------
         tk.Frame(root, bg=BORDER, height=X(1), bd=0).place(
@@ -923,6 +1033,7 @@ class App:
         self.logw.tag_configure("ok", foreground=ACCENT)
         self.logw.tag_configure("warn", foreground=WARN)
         self.logw.tag_configure("err", foreground=ERR)
+        self.logw.tag_configure("file", foreground=OTA)
         self.logw.configure(state="disabled")
 
         self._draw_progress()
@@ -1133,6 +1244,53 @@ class App:
             return
         self.log(f"прошиваю: {cfg.role_title(self.role_slug)}", "ok")
         self.on_drop([self.current_file])
+
+    # ------------------------------------------------------------- OTA
+    def build_ota(self) -> None:
+        """Собирает OTA-пакет (DFU zip) из выбранного .uf2 — для обновления
+        по воздуху через bootloader OTAFIX и приложения Nordic DFU."""
+        if self.busy:
+            self.log("идёт операция — дождись окончания", "warn")
+            return
+        if not getattr(self, "current_file", None):
+            self.rescan_firmware()
+        path = getattr(self, "current_file", None)
+        if not path:
+            self.log("нет файла прошивки: положи .uf2 в папку firmware "
+                     "или нажми «Скачать с GitHub»", "err")
+            self._status("для OTA нужен .uf2 — его нет")
+            return
+        if self.info is not None and self.info.family != UF2_FAMILY_NRF52840:
+            self._fail(f"это UF2 для {family_name(self.info.family)}, "
+                       f"а нужен nRF52840")
+            return
+
+        env = getattr(self, "current_env", None) or self._env() or "firmware"
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+        out_dir = os.path.dirname(os.path.abspath(path)) or app_dir()
+        out = os.path.join(out_dir, f"{env}-ota-{stamp}.zip")
+
+        self.busy = True
+        self._set_progress(0.03)
+        self._status("собираю OTA-пакет…")
+        self.log(f"OTA: {os.path.basename(path)}", "ok")
+        self.log("настройки внутрь пакета не попадают — после OTA их "
+                 "писать в ноду отдельно", "dim")
+
+        def work() -> None:
+            try:
+                self.q.put(("log", "разбираю UF2 по блокам…", "dim"))
+                self.q.put(("ota_progress", 0.12))
+                stats = build_dfu_zip(
+                    path, out,
+                    progress=lambda p: self.q.put(
+                        ("ota_progress", 0.12 + 0.82 * p)))
+                self.q.put(("ota_done", (True, out, stats)))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("ota_done", (False, str(e), None)))
+
+        threading.Thread(target=work, daemon=True).start()
+
 
     # ------------------------------------------------------------- COM
     def _wait_nrf_port(self, timeout: float = 15.0) -> str | None:
@@ -1381,6 +1539,8 @@ class App:
     def _refresh_idle(self) -> None:
         if self.busy or self.state != "idle":
             return
+        if time.monotonic() < self._status_hold_until:
+            return
         if len(self.vols) == 1:
             v = self.vols[0]
             self._status(f"плата: {v.title} · {v.where} · {v.bootloader or 'bootloader'}")
@@ -1394,6 +1554,11 @@ class App:
         self.status_text = text
         shown = elide(text, self.f_status, X(486))
         self.status_lbl.configure(text=shown)
+
+    def _status_hold(self, text: str, seconds: float = 8.0) -> None:
+        """Статус, который не затирается фоновым опросом плат (итог операции)."""
+        self._status_hold_until = time.monotonic() + seconds
+        self._status(text)
 
     def _set_progress(self, value: float) -> None:
         self.progress = max(0.0, min(1.0, value))
@@ -1594,6 +1759,25 @@ class App:
                 elif kind == "online_ready":
                     self.log("прошивка скачана", "ok")
                     self._apply_file(event[1])
+                elif kind == "ota_progress":
+                    self._set_progress(event[1])
+                elif kind == "ota_done":
+                    ok, payload, stats = event[1]
+                    self.busy = False
+                    if ok and stats:
+                        self._set_progress(1.0)
+                        self._status_hold(f"OTA-пакет готов: "
+                                          f"{os.path.basename(payload)}")
+                        self.log(f"образ {fmt_size(stats['image'])} · "
+                                 f"{stats['blocks']} блоков · база "
+                                 f"0x{stats['base']:08X} · crc16 "
+                                 f"0x{stats['crc']:04X}", "dim")
+                        self.log(f"пакет {fmt_size(stats['size'])} "
+                                 f"сохранён: {payload}", "file")
+                    else:
+                        self._set_progress(0.0)
+                        self._status("OTA-пакет не собран")
+                        self.log(f"OTA: {payload}", "err")
                 elif kind == "settings_progress":
                     self._set_progress(event[1])
                 elif kind == "settings_done":

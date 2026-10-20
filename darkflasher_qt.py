@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
 import darktec_cfg as cfg
 from DarkFlasher import (
     APP_NAME, APP_VERSION, FlashJob, FlashResult, Uf2Error, Uf2Info,
-    UF2_FAMILY_NRF52840, VolumeWatcher, family_name, fmt_size,
+    UF2_FAMILY_NRF52840, VolumeWatcher, build_dfu_zip, family_name, fmt_size,
     scan_uf2_volumes,
 )
 
@@ -77,6 +77,15 @@ QPushButton#primary {
 }
 QPushButton#primary:hover { background: #2a6f56; }
 QPushButton#primary:pressed { background: #1d4c3b; }
+QPushButton#ota {
+    background: #d9863a;
+    border-color: #e6a059;
+    color: #1b1108;
+    font-weight: 700;
+}
+QPushButton#ota:hover { background: #e6944a; }
+QPushButton#ota:pressed { background: #b86f2c; }
+QPushButton#ota:disabled { background: #6b4a26; color: #2a2018; }
 QProgressBar {
     background: #161e2b;
     border: none;
@@ -140,6 +149,7 @@ class MainWindow(QMainWindow):
         self.file_path: str | None = None
         self.firmware: dict[str, str] = {}
         self.busy = False
+        self._pending_ota = False
         self.settings = cfg.load_settings()
         self.role_slug = self.settings.get("role", "companion_radio_ble")
         self._progress = 0
@@ -401,6 +411,11 @@ class MainWindow(QMainWindow):
         self.btn_send.setMinimumHeight(38)
         self.btn_send.clicked.connect(self.send_settings_now)
         btns.addWidget(self.btn_send, 1)
+        self.btn_ota = QPushButton("Собрать OTA-ZIP")
+        self.btn_ota.setObjectName("ota")
+        self.btn_ota.setMinimumHeight(38)
+        self.btn_ota.clicked.connect(self.build_ota)
+        btns.addWidget(self.btn_ota, 1)
         root.addLayout(btns)
 
         # log
@@ -481,7 +496,7 @@ class MainWindow(QMainWindow):
                 "не скачалось", "не отправлен", "недоступен", "отклонена")):
             kind = "err"
         color = {"ok": "#4ea583", "warn": "#d9a054", "err": "#d96a6a",
-                 "dim": "#5d6a7c"}.get(kind, "#98a3b3")
+                 "dim": "#5d6a7c", "file": "#d9863a"}.get(kind, "#98a3b3")
         t = time.strftime("%H:%M:%S")
         self.log.append(
             f'<span style="color:#5d6a7c">{t}</span> '
@@ -698,6 +713,95 @@ class MainWindow(QMainWindow):
         self.log_msg(f"пишу {fmt_size(self.info.size)} на {vol.title}", "info")
         FlashJob(self.q, self.info, vol).start()
 
+    # ------------------------------------------------------------------- OTA
+    def build_ota(self) -> None:
+        """Собирает OTA-пакет (Nordic DFU zip) из прошивки для выбранной роли."""
+        if self.busy:
+            self.log_msg("идёт операция — дождись окончания", "warn")
+            return
+        env = self._env()
+        rel = self.selected_release
+        info = rel["files"].get(env) if rel else None
+        if info:
+            local = cfg.scan_firmware().get(env)
+            fresh = False
+            if local and os.path.isfile(local):
+                if not info.get("sha256"):
+                    fresh = True
+                else:
+                    try:
+                        fresh = cfg.file_sha256(local) == info["sha256"]
+                    except OSError:
+                        fresh = False
+            if fresh:
+                self._apply_file(local)
+                self._start_ota_build(local, env)
+            else:
+                self._download_and_ota()
+            return
+        # Релиз не выбран — берём то, что уже лежит в папке firmware.
+        if not self.file_path or not os.path.isfile(self.file_path):
+            self.rescan_firmware()
+        if not self.file_path or not os.path.isfile(self.file_path):
+            self.log_msg("нет файла: выбери версию прошивки или положи .uf2 "
+                         "в папку firmware", "err")
+            return
+        self._start_ota_build(self.file_path, env)
+
+    def _download_and_ota(self) -> None:
+        env = self._env()
+        rel = self.selected_release
+        info = rel["files"].get(env) if rel else None
+        if not info or not info.get("url"):
+            self.log_msg("нет файла: выбери версию прошивки или положи .uf2 "
+                         "в папку firmware", "err")
+            return
+        self.busy = True
+        self._pending_ota = True
+        self.set_progress(0)
+        self.set_status("скачивание прошивки для OTA…")
+        self.log_msg(f"скачиваю {rel['tag']} для «{cfg.role_title(self.role_slug)}»",
+                     "info")
+
+        def work() -> None:
+            def prog(done: int, total: int, speed: float) -> None:
+                self.q.put(("dl_progress", done, total, speed))
+
+            path = cfg.download_firmware(
+                env, info["url"], info.get("sha256", ""), progress=prog,
+                log=lambda m: self.q.put(("log", m, "dim")))
+            self.q.put(("dl_done", path))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _start_ota_build(self, uf2_path: str, env: str) -> None:
+        if self.busy:
+            return
+        stamp = time.strftime("%Y-%m-%d_%H-%M")
+        out_dir = os.path.dirname(os.path.abspath(uf2_path)) or cfg.app_dir()
+        out = os.path.join(out_dir, f"{env}-ota-{stamp}.zip")
+        self.busy = True
+        self._pending_ota = False
+        self.set_progress(0.05)
+        self.set_status("собираю OTA-пакет…")
+        self.log_msg(f"OTA: {os.path.basename(uf2_path)}", "ok")
+        self.log_msg("настройки внутрь пакета не попадают — после OTA их "
+                     "писать в ноду отдельно", "dim")
+
+        def work() -> None:
+            try:
+                self.q.put(("log", "разбираю UF2 по блокам…", "dim"))
+                self.q.put(("ota_progress", 0.15))
+                stats = build_dfu_zip(
+                    uf2_path, out,
+                    progress=lambda p: self.q.put(
+                        ("ota_progress", 0.15 + 0.8 * p)))
+                self.q.put(("ota_done", (True, out, stats)))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("ota_done", (False, str(e), None)))
+
+        threading.Thread(target=work, daemon=True).start()
+
     # -------------------------------------------------------------------- COM
     def _wait_nrf_port(self, timeout: float = 15.0) -> str | None:
         proto = ("frames" if self.role_slug in ("companion_radio_ble",
@@ -799,11 +903,16 @@ class MainWindow(QMainWindow):
                                     f"{mb:.1f} МБ/с")
                 elif kind == "dl_done":
                     self.busy = False
-                    if ev[1]:
+                    if ev[1] and self._pending_ota:
+                        self._apply_file(ev[1])
+                        self.set_progress(0.1)
+                        self._start_ota_build(ev[1], self._env())
+                    elif ev[1]:
                         self._apply_file(ev[1])
                         self.set_progress(0.15)
                         self._begin_flash()
                     else:
+                        self._pending_ota = False
                         self.set_progress(0)
                         self.set_status("скачивание не удалось — смотри лог")
                 elif kind == "flash":
@@ -817,6 +926,25 @@ class MainWindow(QMainWindow):
                     self._apply_file(ev[1])
                 elif kind == "releases":
                     self._populate_versions(ev[1])
+                elif kind == "ota_progress":
+                    self.set_progress(ev[1])
+                elif kind == "ota_done":
+                    ok, payload, stats = ev[1]
+                    self.busy = False
+                    if ok and stats:
+                        self.set_progress(1.0)
+                        self.set_status(f"OTA-пакет готов: "
+                                        f"{os.path.basename(payload)}")
+                        self.log_msg(f"образ {fmt_size(stats['image'])} · "
+                                     f"{stats['blocks']} блоков · база "
+                                     f"0x{stats['base']:08X} · crc16 "
+                                     f"0x{stats['crc']:04X}", "dim")
+                        self.log_msg(f"пакет {fmt_size(stats['size'])} сохранён: "
+                                     f"{payload}", "file")
+                    else:
+                        self.set_progress(0)
+                        self.set_status("OTA-пакет не собран")
+                        self.log_msg(f"OTA: {payload}", "err")
                 elif kind == "settings_progress":
                     self.set_progress(ev[1])
                 elif kind == "settings_done":
