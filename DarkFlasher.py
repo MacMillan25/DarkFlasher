@@ -13,14 +13,15 @@ Dark Flasher — запись .uf2 на nRF52 (nice!nano / Adafruit nRF52 UF2 bo
 Что делает Dark Flasher:
   * находит том по Volume GUID и проверяет INFO_UF2.TXT (буква не важна);
   * пишет файл напрямую, с write-through, и стартует в момент появления тома;
-  * обрыв связи в самом конце считает успехом (все блоки уже приняты);
+  * успехом считает только полностью записанный файл (частичный последний
+    блок — ошибка, даже если том уже исчез);
   * показывает прогресс, лог и внятную причину, если что-то не так.
 
 Режимы:
-  DarkFlasher.py                 — GUI
   DarkFlasher.py --check f.uf2   — проверить файл
   DarkFlasher.py --list          — показать UF2-тома
   DarkFlasher.py --flash f.uf2   — прошить из консоли (ждёт плату)
+  без аргументов                 — запустить Qt-интерфейс (darkflasher_qt.py)
 """
 
 from __future__ import annotations
@@ -28,10 +29,8 @@ from __future__ import annotations
 import argparse
 import ctypes
 import json
-import math
 import os
 import queue
-import re
 import struct
 import sys
 import threading
@@ -40,13 +39,10 @@ import zipfile
 import zlib
 from ctypes import wintypes
 from dataclasses import dataclass
-from datetime import datetime
 
-import darktec_cfg as cfg
 
 APP_NAME = "Dark Flasher"
-APP_VERSION = "1.3"
-WINDOW_TITLE = "Dark Flasher — nRF52 UF2"
+APP_VERSION = "1.4.1"
 
 DEST_NAME = "FW.UF2"          # короткое 8.3-имя: никаких сюрпризов с LFN
 CHUNK_SIZE = 16 * 1024
@@ -62,567 +58,9 @@ UF2_MAGIC_ENDS = (UF2_MAGIC_END_STD, UF2_MAGIC_END_NICE)
 UF2_FAMILY_NRF52840 = 0xADA52840
 UF2_BLOCK = 512
 UF2_PAYLOAD = 256
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+APP_FLASH_BASE = 0x26000
 
-# --------------------------------------------------------------------------
-# Win32
-# --------------------------------------------------------------------------
-
-user32 = ctypes.WinDLL("user32", use_last_error=True)
-kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-shell32 = ctypes.WinDLL("shell32", use_last_error=True)
-dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
-
-INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
-GENERIC_WRITE = 0x40000000
-FILE_SHARE_READ = 0x00000001
-FILE_SHARE_WRITE = 0x00000002
-CREATE_ALWAYS = 2
-FILE_ATTRIBUTE_NORMAL = 0x00000080
-FILE_FLAG_WRITE_THROUGH = 0x80000000
-FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000
-DRIVE_REMOVABLE = 2
-
-WM_DROPFILES = 0x0233
-GWLP_WNDPROC = -4
-WNDPROC = ctypes.WINFUNCTYPE(
-    ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, ctypes.c_size_t, ctypes.c_ssize_t
-)
-
-
-def _init_win32() -> None:
-    kernel32.CreateFileW.restype = wintypes.HANDLE
-    kernel32.CreateFileW.argtypes = [
-        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
-        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
-    ]
-    kernel32.WriteFile.restype = wintypes.BOOL
-    kernel32.WriteFile.argtypes = [
-        wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
-    ]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-
-    kernel32.FindFirstVolumeW.restype = wintypes.HANDLE
-    kernel32.FindFirstVolumeW.argtypes = [wintypes.LPWSTR, wintypes.DWORD]
-    kernel32.FindNextVolumeW.restype = wintypes.BOOL
-    kernel32.FindNextVolumeW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD]
-    kernel32.FindVolumeClose.restype = wintypes.BOOL
-    kernel32.FindVolumeClose.argtypes = [wintypes.HANDLE]
-
-    kernel32.GetDriveTypeW.restype = wintypes.UINT
-    kernel32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
-    kernel32.GetVolumePathNamesForVolumeNameW.restype = wintypes.BOOL
-    kernel32.GetVolumePathNamesForVolumeNameW.argtypes = [
-        wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
-    ]
-    kernel32.GetVolumeInformationW.restype = wintypes.BOOL
-    kernel32.GetVolumeInformationW.argtypes = [
-        wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
-        ctypes.POINTER(wintypes.DWORD), wintypes.LPWSTR, wintypes.DWORD,
-    ]
-    kernel32.GetDiskFreeSpaceExW.restype = wintypes.BOOL
-    kernel32.GetDiskFreeSpaceExW.argtypes = [
-        wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_ulonglong),
-        ctypes.POINTER(ctypes.c_ulonglong), ctypes.POINTER(ctypes.c_ulonglong),
-    ]
-
-    user32.SetWindowLongPtrW.restype = ctypes.c_void_p
-    user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
-    user32.CallWindowProcW.restype = ctypes.c_ssize_t
-    user32.CallWindowProcW.argtypes = [
-        ctypes.c_void_p, wintypes.HWND, wintypes.UINT, ctypes.c_size_t, ctypes.c_ssize_t,
-    ]
-    user32.GetParent.restype = wintypes.HWND
-    user32.GetParent.argtypes = [wintypes.HWND]
-    user32.GetDpiForSystem.restype = wintypes.UINT
-    user32.GetDpiForSystem.argtypes = []
-
-    shell32.DragAcceptFiles.restype = None
-    shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
-    shell32.DragQueryFileW.restype = wintypes.UINT
-    shell32.DragQueryFileW.argtypes = [wintypes.HANDLE, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT]
-    shell32.DragFinish.restype = None
-    shell32.DragFinish.argtypes = [wintypes.HANDLE]
-
-    dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
-    dwmapi.DwmSetWindowAttribute.argtypes = [
-        wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
-    ]
-
-
-_init_win32()
-
-WINERROR_RU = {
-    2: "том или файл не найден (плата отключилась?)",
-    3: "путь не найден",
-    5: "доступ запрещён — том занят антивирусом или другой программой",
-    19: "том защищён от записи",
-    21: "устройство не готово",
-    23: "ошибка данных (плохой кабель/питание?)",
-    31: "общая ошибка устройства",
-    32: "файл занят другим процессом",
-    33: "том занят другим процессом",
-    34: "Windows потерял том — плата перезагрузилась",
-    39: "том занят",
-    87: "неверный параметр",
-    112: "на томе нет места",
-    121: "таймаут операции (устройство не отвечает)",
-    1167: "устройство отключено",
-    1231: "сеть недоступна",
-}
-
-
-def winerror_text(code: int) -> str:
-    if code in WINERROR_RU:
-        return WINERROR_RU[code]
-    try:
-        return ctypes.FormatError(code).strip() or f"ошибка {code}"
-    except Exception:
-        return f"ошибка {code}"
-
-
-# --------------------------------------------------------------------------
-# UF2
-# --------------------------------------------------------------------------
-
-class Uf2Error(Exception):
-    pass
-
-
-def family_name(family: int) -> str:
-    if family == UF2_FAMILY_NRF52840:
-        return "nRF52840"
-    return f"family 0x{family:08X}"
-
-
-@dataclass
-class Uf2Info:
-    path: str
-    size: int
-    num_blocks: int
-    family: int
-    base_addr: int
-    data_bytes: int
-    magic_end: int
-
-    @classmethod
-    def load(cls, path: str) -> "Uf2Info":
-        try:
-            size = os.path.getsize(path)
-        except OSError as e:
-            raise Uf2Error(f"не могу открыть файл: {e.strerror or e}") from e
-        if size < UF2_BLOCK or size % UF2_BLOCK:
-            raise Uf2Error("размер не кратен 512 байт — это не UF2")
-
-        num = size // UF2_BLOCK
-        seen = bytearray(num)
-        family = None
-        base = None
-        magic_end = None
-        with open(path, "rb") as f:
-            for idx in range(num):
-                block = f.read(UF2_BLOCK)
-                if len(block) != UF2_BLOCK:
-                    raise Uf2Error("файл обрезан")
-                magic0, magic1, _flags, addr, payload, block_no, total, fam = \
-                    struct.unpack_from("<8I", block, 0)
-                block_magic_end, = struct.unpack_from("<I", block, 508)
-                if magic0 != UF2_MAGIC0 or magic1 != UF2_MAGIC1:
-                    raise Uf2Error(f"блок {idx}: неверная сигнатура UF2 — файл битый")
-                if block_magic_end not in UF2_MAGIC_ENDS:
-                    raise Uf2Error(
-                        f"блок {idx}: незнакомый UF2_MAGIC_END 0x{block_magic_end:08X}"
-                    )
-                if magic_end is None:
-                    magic_end = block_magic_end
-                elif block_magic_end != magic_end:
-                    raise Uf2Error("в файле смешаны разные варианты UF2")
-                if payload != UF2_PAYLOAD:
-                    raise Uf2Error(f"блок {idx}: неожиданный размер данных")
-                if total != num:
-                    raise Uf2Error(
-                        f"файл неполный: внутри заявлено {total} блоков, а лежит {num}"
-                    )
-                if block_no >= num:
-                    raise Uf2Error(f"блок {idx}: номер {block_no} вне файла")
-                if seen[block_no]:
-                    raise Uf2Error(f"блок {block_no} встречается дважды")
-                seen[block_no] = 1
-                if family is None:
-                    family = fam
-                elif fam != family:
-                    raise Uf2Error("в файле смешаны разные family ID")
-                if base is None:
-                    base = addr
-                elif addr != base + block_no * UF2_PAYLOAD:
-                    raise Uf2Error("блоки идут не подряд — это не обычная прошивка")
-
-        if family is None or family == 0:
-            raise Uf2Error("в UF2 нет family ID — не понимаю, для какого это чипа")
-        if len(seen) != num:
-            raise Uf2Error("файл неполный: не хватает блоков")
-
-        return cls(path=path, size=size, num_blocks=num, family=family,
-                   base_addr=base or 0, data_bytes=num * UF2_PAYLOAD,
-                   magic_end=magic_end or UF2_MAGIC_END_STD)
-
-
-# --------------------------------------------------------------------------
-# Тома
-# --------------------------------------------------------------------------
-
-def list_volume_guids() -> list[str]:
-    out: list[str] = []
-    buf = ctypes.create_unicode_buffer(1024)
-    handle = kernel32.FindFirstVolumeW(buf, 1024)
-    if not handle or handle == INVALID_HANDLE_VALUE:
-        return out
-    try:
-        while True:
-            out.append(buf.value)
-            if not kernel32.FindNextVolumeW(handle, buf, 1024):
-                break
-    finally:
-        kernel32.FindVolumeClose(handle)
-    return out
-
-
-def volume_letter(guid: str) -> str:
-    buf = ctypes.create_unicode_buffer(1024)
-    needed = wintypes.DWORD(0)
-    if kernel32.GetVolumePathNamesForVolumeNameW(guid, buf, 1024, ctypes.byref(needed)):
-        first = buf.value
-        if first:
-            return first.rstrip("\\")
-    return ""
-
-
-def volume_label(guid: str) -> str:
-    buf = ctypes.create_unicode_buffer(256)
-    fs = ctypes.create_unicode_buffer(64)
-    serial = wintypes.DWORD(0)
-    maxlen = wintypes.DWORD(0)
-    flags = wintypes.DWORD(0)
-    if kernel32.GetVolumeInformationW(
-        guid, buf, 256, ctypes.byref(serial), ctypes.byref(maxlen),
-        ctypes.byref(flags), fs, 64,
-    ):
-        return buf.value
-    return ""
-
-
-def volume_free(guid: str) -> int:
-    free = ctypes.c_ulonglong(0)
-    total = ctypes.c_ulonglong(0)
-    total_free = ctypes.c_ulonglong(0)
-    if kernel32.GetDiskFreeSpaceExW(
-        guid, ctypes.byref(free), ctypes.byref(total), ctypes.byref(total_free)
-    ):
-        return int(free.value)
-    return 0
-
-
-def read_info_uf2(path: str) -> str | None:
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            return f.read(8192)
-    except OSError:
-        return None
-
-
-@dataclass(frozen=True)
-class Uf2Volume:
-    path: str
-    letter: str
-    label: str
-    model: str
-    board_id: str
-    bootloader: str
-    free: int
-
-    @property
-    def title(self) -> str:
-        return self.model or self.label or "UF2"
-
-    @property
-    def where(self) -> str:
-        return self.letter or "?"
-
-
-def probe_uf2_volume(guid: str) -> Uf2Volume | None:
-    text = read_info_uf2(guid + "INFO_UF2.TXT")
-    if not text or "UF2" not in text.upper():
-        return None
-    model = ""
-    board_id = ""
-    bootloader = ""
-    for line in text.splitlines():
-        line = line.strip()
-        low = line.lower()
-        if low.startswith("uf2 bootloader"):
-            bootloader = line[len("UF2 Bootloader"):].strip() or line
-        elif low.startswith("model:"):
-            model = line.split(":", 1)[1].strip()
-        elif low.startswith("board-id:"):
-            board_id = line.split(":", 1)[1].strip()
-    return Uf2Volume(
-        path=guid,
-        letter=volume_letter(guid),
-        label=volume_label(guid),
-        model=model,
-        board_id=board_id,
-        bootloader=bootloader,
-        free=volume_free(guid),
-    )
-
-
-def scan_uf2_volumes() -> list[Uf2Volume]:
-    found: list[Uf2Volume] = []
-    for guid in list_volume_guids():
-        vol = probe_uf2_volume(guid)
-        if vol is not None:
-            found.append(vol)
-    return found
-
-
-def volume_present(guid: str) -> bool:
-    return guid in list_volume_guids()
-
-
-def wait_volume_gone(guid: str, timeout: float) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not volume_present(guid):
-            return True
-        time.sleep(0.12)
-    return False
-
-
-# --------------------------------------------------------------------------
-# Запись
-# --------------------------------------------------------------------------
-
-@dataclass
-class FlashResult:
-    ok: bool
-    written: int
-    total: int
-    winerror: int
-    message: str
-    elapsed: float
-    last_block_ok: bool = True
-    rebooted: bool = False
-    cancelled: bool = False
-    no_volume: bool = False
-
-    @property
-    def percent(self) -> int:
-        return int(self.written * 100 / self.total) if self.total else 0
-
-
-def _write_all(handle, data: bytes, progress, base: int, total: int) -> tuple[int, int]:
-    buf = ctypes.create_string_buffer(data, len(data))
-    offset = 0
-    size = len(data)
-    while offset < size:
-        written = wintypes.DWORD(0)
-        ok = kernel32.WriteFile(
-            handle, ctypes.byref(buf, offset), size - offset,
-            ctypes.byref(written), None,
-        )
-        if not ok:
-            return offset + int(written.value), ctypes.get_last_error()
-        if written.value == 0:
-            return offset, 31
-        offset += int(written.value)
-        if progress is not None:
-            progress(base + offset, total)
-    return offset, 0
-
-
-def write_uf2(vol_path: str, src_path: str, total: int,
-              progress=None, cancelled=None) -> FlashResult:
-    """
-    Пишет файл на том. Последний 512-байтный блок — отдельным WriteFile:
-    если связь оборвалась ровно на нём, это значит, что загрузчик принял
-    последний блок и ушёл в ребут (а не что запись провалилась).
-    """
-    started = time.monotonic()
-    dest = vol_path + DEST_NAME
-    handle = kernel32.CreateFileW(
-        dest, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, None,
-        CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH | FILE_FLAG_SEQUENTIAL_SCAN,
-        None,
-    )
-    if not handle or handle == INVALID_HANDLE_VALUE:
-        code = ctypes.get_last_error()
-        return FlashResult(False, 0, total, code, winerror_text(code),
-                           time.monotonic() - started)
-
-    written = 0
-    err = 0
-    last_ok = True
-    body = max(0, total - UF2_BLOCK)
-    try:
-        with open(src_path, "rb") as f:
-            remaining = body
-            while remaining > 0:
-                if cancelled is not None and cancelled():
-                    return FlashResult(False, written, total, 0, "отменено",
-                                       time.monotonic() - started, cancelled=True)
-                chunk = f.read(min(CHUNK_SIZE, remaining))
-                if not chunk:
-                    err = 31
-                    break
-                got, code = _write_all(handle, chunk, progress, written, total)
-                written += got
-                if code:
-                    err = code
-                    break
-                remaining -= got
-            if err == 0:
-                tail = f.read(UF2_BLOCK)
-                if len(tail) == UF2_BLOCK:
-                    got, code = _write_all(handle, tail, progress, written, total)
-                    written += got
-                    if code:
-                        err = code
-                        last_ok = False
-                else:
-                    err = 31
-    finally:
-        # После ребута CloseHandle может вернуть ошибку — это нормально.
-        kernel32.CloseHandle(handle)
-
-    elapsed = time.monotonic() - started
-    ok = err == 0 and written == total
-    if ok:
-        message = "готово"
-    elif err:
-        message = winerror_text(err)
-    else:
-        message = "записано не всё"
-    return FlashResult(ok, written, total, err, message, elapsed, last_block_ok=last_ok)
-
-
-# --------------------------------------------------------------------------
-# Фоновые потоки
-# --------------------------------------------------------------------------
-
-class VolumeWatcher(threading.Thread):
-    """Каждые 250 мс смотрит, есть ли UF2-том. UI обновляется через очередь."""
-
-    def __init__(self, q: queue.Queue, interval: float = 0.25):
-        super().__init__(name="volume-watcher", daemon=True)
-        self.q = q
-        self.interval = interval
-        self._stop = threading.Event()
-        self._pause = threading.Event()
-
-    def stop(self) -> None:
-        self._stop.set()
-
-    def pause(self) -> None:
-        self._pause.set()
-
-    def resume(self) -> None:
-        self._pause.clear()
-
-    def run(self) -> None:
-        last: tuple | None = None
-        while not self._stop.is_set():
-            if self._pause.is_set():
-                self._stop.wait(0.1)
-                continue
-            try:
-                vols = scan_uf2_volumes()
-            except Exception:
-                vols = []
-            signature = tuple((v.path, v.model, v.board_id) for v in vols)
-            if signature != last:
-                last = signature
-                self.q.put(("volumes", vols))
-            self._stop.wait(self.interval)
-
-
-class FlashJob(threading.Thread):
-    def __init__(self, q: queue.Queue, info: Uf2Info, volume: Uf2Volume):
-        super().__init__(name="flash-job", daemon=True)
-        self.q = q
-        self.info = info
-        self.volume = volume
-
-    def _resolve_volume(self) -> Uf2Volume | None:
-        vols = scan_uf2_volumes()
-        if not vols:
-            return None
-        for v in vols:
-            if v.path == self.volume.path:
-                return v
-        same = [v for v in vols if v.board_id and v.board_id == self.volume.board_id]
-        if len(same) == 1:
-            return same[0]
-        if len(vols) == 1:
-            return vols[0]
-        return None
-
-    def run(self) -> None:
-        started = time.monotonic()
-        try:
-            vol = self._resolve_volume()
-            if vol is None:
-                self.q.put(("flash", FlashResult(
-                    False, 0, self.info.size, 0,
-                    "плата не в режиме загрузчика", time.monotonic() - started,
-                    no_volume=True)))
-                return
-            if vol.path != self.volume.path:
-                self.q.put(("log", f"том переподключился: {vol.where}", "warn"))
-            res = write_uf2(
-                vol.path, self.info.path, self.info.size,
-                progress=lambda done, total: self.q.put(("progress", done, total)),
-            )
-            res.elapsed = time.monotonic() - started
-
-            if res.written >= self.info.size - UF2_BLOCK:
-                self.q.put(("log", "файл записан, жду перезагрузку платы…", "info"))
-                self.q.put(("status", "файл записан, жду перезагрузку платы…"))
-                gone = wait_volume_gone(vol.path, REBOOT_WAIT)
-                res.rebooted = gone
-                if gone:
-                    res.ok = True
-                    if res.written < self.info.size:
-                        res.message = "последний блок ушёл в момент ребута"
-                    else:
-                        res.message = "готово"
-                else:
-                    res.ok = res.written == self.info.size
-                    if res.ok:
-                        res.message = "записано, но плата не перезагрузилась"
-                    else:
-                        res.message = "последний блок не записался"
-            else:
-                res.ok = False
-                gone = not volume_present(vol.path)
-                if res.written == 0 and gone:
-                    res.no_volume = True
-                    res.message = "плата исчезла до начала записи"
-                elif gone:
-                    res.message = f"обрыв на {res.percent}% — тома уже нет"
-                elif not res.message:
-                    res.message = "запись прервалась"
-            self.q.put(("flash", res))
-        except Exception as e:  # noqa: BLE001 — поток не должен падать молча
-            self.q.put(("flash", FlashResult(
-                False, 0, self.info.size, 0, f"внутренняя ошибка: {e}",
-                time.monotonic() - started)))
-
-
-
-# --------------------------------------------------------------------------
 # OTA: сборка Nordic DFU пакета (zip) из готового .uf2
 # --------------------------------------------------------------------------
 
@@ -647,47 +85,82 @@ FLAG_CAPACITY = 1 << 2
 FLAG_MODULE = 1 << 3
 
 
+def _utf8_prefix(text: str, max_bytes: int) -> bytes:
+    """Обрезает UTF-8 по границе символа, чтобы не получить битый текст."""
+    raw = (text or "").encode("utf-8")
+    if len(raw) <= max_bytes:
+        return raw
+    raw = raw[:max_bytes]
+    while raw:
+        try:
+            raw.decode("utf-8")
+            return raw
+        except UnicodeDecodeError:
+            raw = raw[:-1]
+    return b""
+
+
 def pack_factory_payload(settings: dict) -> tuple[bytes, int]:
-    """Собирает 128-байтовую полезную часть и набор флагов «что применять»."""
+    """Собирает 128-байтовую полезную часть и набор флагов «что применять».
+
+    Флаги `use_*` из окна: выключенная настройка не попадает ни в блок, ни в
+    набор флагов — прошивка её просто не трогает.
+    """
     buf = bytearray(FACTORY_PAYLOAD)
     flags = 0
 
-    name = (settings.get("name") or "").strip()
-    if name:
-        raw = name.encode("utf-8")[:31]
-        buf[0:len(raw)] = raw
-        flags |= FLAG_NAME
+    if settings.get("use_name", True):
+        name = (settings.get("name") or "").strip()
+        if name:
+            raw = _utf8_prefix(name, 31)
+            buf[0:len(raw)] = raw
+            flags |= FLAG_NAME
 
-    try:
-        freq = float(settings.get("freq") or 0)
-        bw = float(settings.get("bw") or 0)
-        sf = int(settings.get("sf") or 0)
-        cr = int(settings.get("cr") or 0)
-        tx = int(settings.get("tx") or 0)
-    except (TypeError, ValueError):
-        freq = bw = 0.0
-        sf = cr = tx = 0
-    if freq > 0 and bw > 0 and sf > 0 and cr > 0:
+    # В прошивке мощность лежит в том же флаге, что и радио. Поэтому в
+    # заводской блок они вшиваются только вместе; раздельно — командами по USB.
+    if settings.get("use_radio", True) and settings.get("use_tx", True):
+        try:
+            freq = float(settings.get("freq") or 0)
+            bw = float(settings.get("bw") or 0)
+            sf = int(settings.get("sf") or 0)
+            cr = int(settings.get("cr") or 0)
+            tx = int(settings.get("tx") or 0)
+        except (TypeError, ValueError) as e:
+            raise Uf2Error("радио: в настройках не числа") from e
+        if not (100.0 <= freq <= 6000.0):
+            raise Uf2Error("частота вне диапазона 100..6000 МГц")
+        if not (7.8 <= bw <= 500.0):
+            raise Uf2Error("полоса вне диапазона 7.8..500 кГц")
+        if not (5 <= sf <= 12):
+            raise Uf2Error("SF вне диапазона 5..12")
+        if not (5 <= cr <= 8):
+            raise Uf2Error("CR вне диапазона 5..8")
+        if not (-9 <= tx <= 22):
+            raise Uf2Error("мощность вне диапазона -9..22 дБм")
         struct.pack_into("<ff", buf, 32, freq, bw)
         buf[40] = sf & 0xFF
         buf[41] = cr & 0xFF
-        struct.pack_into("<b", buf, 42, max(-9, min(22, tx)))
+        struct.pack_into("<b", buf, 42, tx)
         flags |= FLAG_RADIO
 
-    try:
-        cap = int(settings.get("capacity") or 0)
-    except (TypeError, ValueError):
-        cap = 0
-    if 1000 <= cap <= 10000:
+    if settings.get("use_capacity", True):
+        try:
+            cap = int(settings.get("capacity") or 0)
+        except (TypeError, ValueError) as e:
+            raise Uf2Error("ёмкость батареи: не число") from e
+        if not (1000 <= cap <= 10000):
+            raise Uf2Error("ёмкость батареи вне диапазона 1000..10000 мАч")
         buf[43] = 0                      # CAP_USER
         struct.pack_into("<H", buf, 44, cap)
         flags |= FLAG_CAPACITY
 
-    try:
-        module = int(settings.get("module") or 0)
-    except (TypeError, ValueError):
-        module = 0
-    if 0 <= module <= 3:
+    if settings.get("use_module", True):
+        try:
+            module = int(settings.get("module") or 0)
+        except (TypeError, ValueError) as e:
+            raise Uf2Error("радиомодуль: не число") from e
+        if not (0 <= module <= 3):
+            raise Uf2Error("радиомодуль вне диапазона 0..3")
         buf[46] = module & 0xFF
         flags |= FLAG_MODULE
 
@@ -767,56 +240,54 @@ def apply_factory_cfg_to_uf2(src_path: str, dst_path: str,
     img = bytearray(image)
     stats = patch_factory_cfg(img, payload)
 
-    data = bytearray(open(src_path, "rb").read())
+    with open(src_path, "rb") as src:
+        data = bytearray(src.read())
     total = len(data) // UF2_BLOCK
     for i in range(total):
         _m0, _m1, _flags, addr, size = struct.unpack_from("<5I", data, i * UF2_BLOCK)
+        if size != UF2_PAYLOAD:
+            raise Uf2Error(f"блок {i}: неожиданный размер данных")
         off = addr - base
-        if off < 0 or off >= len(img):
-            continue
+        if off < 0 or off + size > len(img):
+            raise Uf2Error(f"блок {i}: адрес вне образа")
         chunk = bytes(img[off:off + size])
         data[i * UF2_BLOCK + 32:i * UF2_BLOCK + 32 + len(chunk)] = chunk
 
     tmp = dst_path + ".part"
-    with open(tmp, "wb") as f:
-        f.write(data)
-    os.replace(tmp, dst_path)
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, dst_path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
     stats.update({"flags": flags, "size": os.path.getsize(dst_path),
                   "blocks": total, "base": base, "image": len(img)})
     return stats
 
 
 def uf2_to_image(path: str) -> tuple[bytes, int, int]:
-    """Склеивает блоки UF2 в непрерывный образ: (данные, базовый адрес, блоков)."""
-    try:
-        size = os.path.getsize(path)
-    except OSError as e:
-        raise Uf2Error(f"не могу открыть файл: {e.strerror or e}") from e
-    if size < UF2_BLOCK or size % UF2_BLOCK:
-        raise Uf2Error("размер не кратен 512 байт — это не UF2")
-    total = size // UF2_BLOCK
-    chunks: dict[int, bytes] = {}
-    base: int | None = None
-    end = 0
+    """Склеивает блоки UF2 в непрерывный образ: (данные, базовый адрес, блоков).
+
+    Валидацию делает Uf2Info.load — здесь только сборка, чтобы не тащить
+    второй набор проверок и не выделять память по адресам из битого файла.
+    """
+    info = Uf2Info.load(path)
+    image = bytearray(b"\xff" * (info.num_blocks * UF2_PAYLOAD))
     with open(path, "rb") as f:
-        for idx in range(total):
+        for idx in range(info.num_blocks):
             block = f.read(UF2_BLOCK)
             if len(block) != UF2_BLOCK:
                 raise Uf2Error("файл обрезан")
-            magic0, magic1, _flags, addr, payload = struct.unpack_from("<5I", block, 0)
-            if magic0 != UF2_MAGIC0 or magic1 != UF2_MAGIC1:
-                raise Uf2Error(f"блок {idx}: неверная сигнатура UF2")
-            if payload > UF2_PAYLOAD:
-                payload = UF2_PAYLOAD
-            chunks[addr] = block[32:32 + payload]
-            base = addr if base is None else min(base, addr)
-            end = max(end, addr + payload)
-    if base is None:
-        raise Uf2Error("в файле нет данных")
-    image = bytearray(b"\xff" * (end - base))
-    for addr, data in chunks.items():
-        image[addr - base:addr - base + len(data)] = data
-    return bytes(image), base, total
+            _m0, _m1, _flags, addr, payload = struct.unpack_from("<5I", block, 0)
+            off = addr - info.base_addr
+            if payload != UF2_PAYLOAD or off < 0 or off + payload > len(image):
+                raise Uf2Error(f"блок {idx}: адрес вне образа")
+            image[off:off + payload] = block[32:32 + payload]
+    return bytes(image), info.base_addr, info.num_blocks
 
 
 def dfu_crc16(data: bytes) -> int:
@@ -834,9 +305,17 @@ def build_dfu_zip_from_image(image: bytes, out_path: str,
                              base: int = 0, blocks: int = 0,
                              progress=None) -> dict:
     """Собирает Nordic DFU пакет из готового образа (bytes)."""
+    if base != APP_FLASH_BASE:
+        raise Uf2Error(
+            f"образ начинается с 0x{base:X}, а приложение nRF52840 — "
+            f"с 0x{APP_FLASH_BASE:X}; такой образ нельзя лить через DFU")
     if progress:
         progress(0.45)
     image = image.rstrip(b"\xff")          # хвост стирания в пакет не кладём
+    if not image:
+        raise Uf2Error("пустой образ — нечего паковать")
+    if len(image) % 4:
+        image += b"\xff" * (4 - len(image) % 4)
     crc = dfu_crc16(image)
     if progress:
         progress(0.75)
@@ -858,33 +337,29 @@ def build_dfu_zip_from_image(image: bytes, out_path: str,
     }, "dfu_version": 0.5}}
 
     tmp = out_path + ".part"
-    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as z:
-        z.writestr("manifest.json", json.dumps(manifest, indent=4))
-        z.writestr("firmware.dat", init)
-        z.writestr("firmware.bin", image)
-    os.replace(tmp, out_path)
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as z:
+            z.writestr("manifest.json", json.dumps(manifest, indent=4))
+            z.writestr("firmware.dat", init)
+            z.writestr("firmware.bin", image)
+        os.replace(tmp, out_path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
     if progress:
         progress(1.0)
     return {"size": os.path.getsize(out_path), "image": len(image),
             "base": base, "blocks": blocks, "crc": crc}
 
 
-def build_dfu_zip(uf2_path: str, out_path: str,
-                  app_version: int = 0xFFFFFFFF, progress=None) -> dict:
-    """Собирает OTA-пакет (Nordic DFU zip) из .uf2."""
-    image, base, blocks = uf2_to_image(uf2_path)
-    return build_dfu_zip_from_image(image, out_path, app_version=app_version,
-                                    base=base, blocks=blocks, progress=progress)
-
-
 # --------------------------------------------------------------------------
 # Win32
 # --------------------------------------------------------------------------
 
-user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-shell32 = ctypes.WinDLL("shell32", use_last_error=True)
-dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
 
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 GENERIC_WRITE = 0x40000000
@@ -894,13 +369,7 @@ CREATE_ALWAYS = 2
 FILE_ATTRIBUTE_NORMAL = 0x00000080
 FILE_FLAG_WRITE_THROUGH = 0x80000000
 FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000
-DRIVE_REMOVABLE = 2
 
-WM_DROPFILES = 0x0233
-GWLP_WNDPROC = -4
-WNDPROC = ctypes.WINFUNCTYPE(
-    ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, ctypes.c_size_t, ctypes.c_ssize_t
-)
 
 
 def _init_win32() -> None:
@@ -924,8 +393,6 @@ def _init_win32() -> None:
     kernel32.FindVolumeClose.restype = wintypes.BOOL
     kernel32.FindVolumeClose.argtypes = [wintypes.HANDLE]
 
-    kernel32.GetDriveTypeW.restype = wintypes.UINT
-    kernel32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
     kernel32.GetVolumePathNamesForVolumeNameW.restype = wintypes.BOOL
     kernel32.GetVolumePathNamesForVolumeNameW.argtypes = [
         wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
@@ -935,34 +402,6 @@ def _init_win32() -> None:
         wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD,
         ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
         ctypes.POINTER(wintypes.DWORD), wintypes.LPWSTR, wintypes.DWORD,
-    ]
-    kernel32.GetDiskFreeSpaceExW.restype = wintypes.BOOL
-    kernel32.GetDiskFreeSpaceExW.argtypes = [
-        wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_ulonglong),
-        ctypes.POINTER(ctypes.c_ulonglong), ctypes.POINTER(ctypes.c_ulonglong),
-    ]
-
-    user32.SetWindowLongPtrW.restype = ctypes.c_void_p
-    user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
-    user32.CallWindowProcW.restype = ctypes.c_ssize_t
-    user32.CallWindowProcW.argtypes = [
-        ctypes.c_void_p, wintypes.HWND, wintypes.UINT, ctypes.c_size_t, ctypes.c_ssize_t,
-    ]
-    user32.GetParent.restype = wintypes.HWND
-    user32.GetParent.argtypes = [wintypes.HWND]
-    user32.GetDpiForSystem.restype = wintypes.UINT
-    user32.GetDpiForSystem.argtypes = []
-
-    shell32.DragAcceptFiles.restype = None
-    shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
-    shell32.DragQueryFileW.restype = wintypes.UINT
-    shell32.DragQueryFileW.argtypes = [wintypes.HANDLE, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT]
-    shell32.DragFinish.restype = None
-    shell32.DragFinish.argtypes = [wintypes.HANDLE]
-
-    dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
-    dwmapi.DwmSetWindowAttribute.argtypes = [
-        wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
     ]
 
 
@@ -979,7 +418,7 @@ WINERROR_RU = {
     32: "файл занят другим процессом",
     33: "том занят другим процессом",
     34: "Windows потерял том — плата перезагрузилась",
-    39: "том занят",
+    39: "диск полон",
     87: "неверный параметр",
     112: "на томе нет места",
     121: "таймаут операции (устройство не отвечает)",
@@ -1018,7 +457,6 @@ class Uf2Info:
     num_blocks: int
     family: int
     base_addr: int
-    data_bytes: int
     magic_end: int
 
     @classmethod
@@ -1031,6 +469,8 @@ class Uf2Info:
             raise Uf2Error("размер не кратен 512 байт — это не UF2")
 
         num = size // UF2_BLOCK
+        if num * UF2_PAYLOAD > MAX_IMAGE_BYTES:
+            raise Uf2Error("UF2 слишком большой для nRF52840")
         seen = bytearray(num)
         family = None
         base = None
@@ -1068,19 +508,21 @@ class Uf2Info:
                     family = fam
                 elif fam != family:
                     raise Uf2Error("в файле смешаны разные family ID")
+                # База не зависит от порядка блоков в файле: UF2 не требует,
+                # чтобы block 0 лежал первым.
+                block_base = addr - block_no * UF2_PAYLOAD
                 if base is None:
-                    base = addr
-                elif addr != base + block_no * UF2_PAYLOAD:
-                    raise Uf2Error("блоки идут не подряд — это не обычная прошивка")
+                    base = block_base
+                elif block_base != base:
+                    raise Uf2Error("блоки не образуют непрерывный образ")
 
         if family is None or family == 0:
             raise Uf2Error("в UF2 нет family ID — не понимаю, для какого это чипа")
-        if len(seen) != num:
-            raise Uf2Error("файл неполный: не хватает блоков")
+        if base is None:
+            raise Uf2Error("в UF2 нет данных")
 
         return cls(path=path, size=size, num_blocks=num, family=family,
-                   base_addr=base or 0, data_bytes=num * UF2_PAYLOAD,
-                   magic_end=magic_end or UF2_MAGIC_END_STD)
+                   base_addr=base, magic_end=magic_end or UF2_MAGIC_END_STD)
 
 
 # --------------------------------------------------------------------------
@@ -1127,17 +569,6 @@ def volume_label(guid: str) -> str:
     return ""
 
 
-def volume_free(guid: str) -> int:
-    free = ctypes.c_ulonglong(0)
-    total = ctypes.c_ulonglong(0)
-    total_free = ctypes.c_ulonglong(0)
-    if kernel32.GetDiskFreeSpaceExW(
-        guid, ctypes.byref(free), ctypes.byref(total), ctypes.byref(total_free)
-    ):
-        return int(free.value)
-    return 0
-
-
 def read_info_uf2(path: str) -> str | None:
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -1154,7 +585,6 @@ class Uf2Volume:
     model: str
     board_id: str
     bootloader: str
-    free: int
 
     @property
     def title(self) -> str:
@@ -1168,6 +598,10 @@ class Uf2Volume:
 def probe_uf2_volume(guid: str) -> Uf2Volume | None:
     text = read_info_uf2(guid + "INFO_UF2.TXT")
     if not text or "UF2" not in text.upper():
+        return None
+    # Не путаем nRF52 с RP2040/другими UF2-загрузчиками: у них тоже есть
+    # INFO_UF2.TXT, но прошивка не та.
+    if "nrf" not in text.lower() and "adafruit" not in text.lower():
         return None
     model = ""
     board_id = ""
@@ -1188,7 +622,6 @@ def probe_uf2_volume(guid: str) -> Uf2Volume | None:
         model=model,
         board_id=board_id,
         bootloader=bootloader,
-        free=volume_free(guid),
     )
 
 
@@ -1264,15 +697,36 @@ def write_uf2(vol_path: str, src_path: str, total: int,
     последний блок и ушёл в ребут (а не что запись провалилась).
     """
     started = time.monotonic()
+    try:
+        src_size = os.path.getsize(src_path)
+    except OSError as e:
+        return FlashResult(False, 0, total, 0,
+                           f"не могу открыть файл: {e.strerror or e}",
+                           time.monotonic() - started)
+    if src_size != total:
+        return FlashResult(False, 0, total, 0,
+                           "файл изменился после проверки — выбери его заново",
+                           time.monotonic() - started)
     dest = vol_path + DEST_NAME
-    handle = kernel32.CreateFileW(
-        dest, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, None,
-        CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH | FILE_FLAG_SEQUENTIAL_SCAN,
-        None,
-    )
-    if not handle or handle == INVALID_HANDLE_VALUE:
+    handle = 0
+    code = 0
+    for attempt in range(4):
+        handle = kernel32.CreateFileW(
+            dest, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, None,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH | FILE_FLAG_SEQUENTIAL_SCAN,
+            None,
+        )
+        if handle and handle != INVALID_HANDLE_VALUE:
+            break
         code = ctypes.get_last_error()
+        # Explorer/антивирус может на мгновение держать файл — даём шанс.
+        if code in (5, 32, 33) and attempt < 3:
+            time.sleep(0.3)
+            continue
+        return FlashResult(False, 0, total, code, winerror_text(code),
+                           time.monotonic() - started)
+    if not handle or handle == INVALID_HANDLE_VALUE:
         return FlashResult(False, 0, total, code, winerror_text(code),
                            time.monotonic() - started)
 
@@ -1354,7 +808,10 @@ class VolumeWatcher(threading.Thread):
             try:
                 vols = scan_uf2_volumes()
             except Exception:
-                vols = []
+                # Один сбой перечисления томов не должен выглядеть как
+                # «плата отключилась»: пропускаем цикл, оставляем прошлое.
+                self._stop.wait(self.interval)
+                continue
             signature = tuple((v.path, v.model, v.board_id) for v in vols)
             if signature != last:
                 last = signature
@@ -1379,8 +836,7 @@ class FlashJob(threading.Thread):
         same = [v for v in vols if v.board_id and v.board_id == self.volume.board_id]
         if len(same) == 1:
             return same[0]
-        if len(vols) == 1:
-            return vols[0]
+        # Единственный «другой» том — это уже другая плата; не шьём в неё.
         return None
 
     def run(self) -> None:
@@ -1400,30 +856,24 @@ class FlashJob(threading.Thread):
                 progress=lambda done, total: self.q.put(("progress", done, total)),
             )
             res.elapsed = time.monotonic() - started
+            size = self.info.size
 
-            if res.written >= self.info.size - UF2_BLOCK:
-                self.q.put(("log", "файл записан, жду перезагрузку платы…", "info"))
-                self.q.put(("status", "файл записан, жду перезагрузку платы…"))
-                gone = wait_volume_gone(vol.path, REBOOT_WAIT)
-                res.rebooted = gone
-                if gone:
-                    res.ok = True
-                    if res.written < self.info.size:
-                        res.message = "последний блок ушёл в момент ребута"
-                    else:
-                        res.message = "готово"
-                else:
-                    res.ok = res.written == self.info.size
-                    if res.ok:
-                        res.message = "записано, но плата не перезагрузилась"
-                    else:
-                        res.message = "последний блок не записался"
+            if res.written == size and res.ok:
+                res.ok = True
+                res.rebooted = wait_volume_gone(vol.path, REBOOT_WAIT)
+                res.message = ("готово" if res.rebooted
+                               else "записано, но плата не перезагрузилась")
             else:
+                # Частично записанный последний блок — не успех, даже если
+                # том исчез: отличить ребут от выдёргивания кабеля нельзя.
                 res.ok = False
                 gone = not volume_present(vol.path)
                 if res.written == 0 and gone:
                     res.no_volume = True
                     res.message = "плата исчезла до начала записи"
+                elif not res.last_block_ok:
+                    res.message = ("последний блок не подтверждён — "
+                                   "прошей ещё раз")
                 elif gone:
                     res.message = f"обрыв на {res.percent}% — тома уже нет"
                 elif not res.message:
@@ -1436,73 +886,10 @@ class FlashJob(threading.Thread):
 
 
 
-# --------------------------------------------------------------------------
-# Оформление
-# --------------------------------------------------------------------------
-
-BG = "#0b0e14"
-PANEL = "#111722"
-PANEL2 = "#161e2b"
-BORDER = "#222c3c"
-BORDER_HOVER = "#33415a"
-TEXT = "#e6ebf2"
-DIM = "#98a3b3"
-FAINT = "#5d6a7c"
-ACCENT = "#4ea583"
-ACCENT_DARK = "#235c47"
-WARN = "#d9a054"
-WARN_DARK = "#6b5426"
-ERR = "#d96a6a"
-ERR_DARK = "#6e2f35"
-BLUE = "#6cb6ff"
-BLUE_DARK = "#1d3a5f"
-OTA = "#d9863a"          # оранжевый: кнопка сборки OTA-пакета
-OTA_DARK = "#7a4a17"
-OTA_TXT = "#1b1108"
-
-# ------------------------------- geometry ---------------------------------
-S = 1.0  # DPI scale, ставится в launch_gui()
-
-
-def X(v: float) -> int:
-    return int(round(v * S))
-
-
-def enable_dpi() -> int:
-    dpi = 96
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        try:
-            user32.SetProcessDPIAware()
-        except Exception:
-            pass
-    try:
-        dpi = int(user32.GetDpiForSystem())
-    except Exception:
-        dpi = 96
-    return dpi if dpi >= 72 else 96
-
-
 def fmt_size(n: int) -> str:
     if n >= 1024 * 1024:
         return f"{n / 1024 / 1024:.2f} МБ"
     return f"{n / 1024:.0f} КБ"
-
-
-def elide(text: str, font, max_px: int) -> str:
-    if max_px <= 0:
-        return ""
-    if font.measure(text) <= max_px:
-        return text
-    while text and font.measure(text + "…") > max_px:
-        text = text[:-1]
-    return text + "…"
-
-
-def resource_path(name: str) -> str:
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, name)
 
 
 def app_dir() -> str:
@@ -1512,11 +899,7 @@ def app_dir() -> str:
 
 
 def ensure_std_streams() -> None:
-    """
-    В windowed-сборке (и pythonw) sys.stdout/stderr = None. Исключение внутри
-    ctypes-колбэка в таком процессе может закончиться CRT-abort (0xc0000409),
-    поэтому даём потокам файл и включаем faulthandler.
-    """
+    """В windowed-сборке stdout/stderr = None; даём файл и faulthandler."""
     if sys.stderr is not None and sys.stdout is not None:
         return
     try:
@@ -1534,1155 +917,6 @@ def ensure_std_streams() -> None:
     except Exception:
         pass
 
-
-class App:
-    def __init__(self, root, start_path: str | None = None):
-        import tkinter as tk
-        import tkinter.font as tkfont
-        from tkinter import filedialog, messagebox
-
-        self.tk = tk
-        self.filedialog = filedialog
-        self.messagebox = messagebox
-        self.root = root
-        self.q: queue.Queue = queue.Queue()
-        self.vols: list[Uf2Volume] = []
-        self.info: Uf2Info | None = None
-        self.file_path: str | None = None
-        self.state = "idle"
-        self.progress = 0.0
-        self.busy = False
-        self.status_text = ""
-        self._status_hold_until = 0.0
-        self.last_error = ""
-        self._pulse_on = False
-        self._pulse_job = None
-        self._zone_sub_id = None
-        self._hover = False
-        self._last_drop_at = 0.0
-        self._closed = False
-        self._log_err_shown = False
-        self._drop_queue: list[int] = []
-        self._drop_seen: set[int] = set()
-
-        # Настройки DarkTec и порт до прошивки: после ребута нода поднимет
-        # новый COM, его и ждём, чтобы отправить конфигурацию.
-        self.settings = cfg.load_settings()
-        self.firmware: dict[str, str] = {}
-        self.current_file: str | None = None
-        self.current_env: str | None = None
-
-        root.title(WINDOW_TITLE)
-        root.configure(bg=BG)
-        root.resizable(False, False)
-        root.protocol("WM_DELETE_WINDOW", self.on_close)
-        root.bind("<Escape>", lambda _e: self.on_close())
-        root.bind("<Control-o>", lambda _e: self.choose_file())
-
-        self.W = X(780)
-        self.H = X(920)
-        sw = root.winfo_screenwidth()
-        sh = root.winfo_screenheight()
-        x = max(0, (sw - self.W) // 2)
-        y = max(0, (sh - self.H) // 3)
-        root.geometry(f"{self.W}x{self.H}+{x}+{y}")
-
-        self.f_title = tkfont.Font(family="Segoe UI", size=15, weight="bold")
-        self.f_sub = tkfont.Font(family="Segoe UI", size=9)
-        self.f_zone = tkfont.Font(family="Segoe UI", size=13, weight="bold")
-        self.f_zone2 = tkfont.Font(family="Segoe UI", size=9)
-        self.f_name = tkfont.Font(family="Segoe UI", size=10, weight="bold")
-        self.f_meta = tkfont.Font(family="Segoe UI", size=9)
-        self.f_status = tkfont.Font(family="Segoe UI", size=9)
-        self.f_badge = tkfont.Font(family="Segoe UI", size=8, weight="bold")
-        self.f_log = tkfont.Font(family="Consolas", size=9)
-
-        self._build()
-        self._install_drop_target()
-        self._set_icon()
-        self._log_file_banner()
-
-        self.watcher = VolumeWatcher(self.q)
-        self.watcher.start()
-        self.root.after(50, self._pump)
-        self.root.after(60, self._poll_drops)
-        self.root.after(120, self._dark_titlebar)
-        self.root.after(250, self._refresh_idle)
-
-        if start_path and os.path.isfile(start_path):
-            self.root.after(450, lambda: self.on_drop([start_path]))
-
-    # ------------------------------------------------------------------ UI
-    def _build(self) -> None:
-        tk = self.tk
-        root = self.root
-
-        # header -----------------------------------------------------------
-        self.logo = tk.Canvas(root, width=X(32), height=X(32), bg=BG,
-                              highlightthickness=0, bd=0)
-        self.logo.place(x=X(24), y=X(22))
-        self._draw_logo(self.logo, X(32), X(32))
-
-        tk.Label(root, text=APP_NAME, bg=BG, fg=TEXT, font=self.f_title,
-                 anchor="w").place(x=X(68), y=X(18), width=X(320), height=X(24))
-        tk.Label(root, text=f"nRF52 · UF2 · v{APP_VERSION}", bg=BG, fg=FAINT,
-                 font=self.f_sub, anchor="w").place(x=X(69), y=X(43),
-                                                    width=X(320), height=X(18))
-
-        self.badge = tk.Canvas(root, bg=BG, highlightthickness=0, bd=0,
-                               height=X(24))
-        self.badge.place(x=X(780 - 24 - 150), y=X(26), width=X(150), height=X(24))
-
-        # role + source ----------------------------------------------------
-        tk.Label(root, text="РОЛЬ", bg=BG, fg=FAINT,
-                 font=self.f_badge).place(x=X(24), y=X(68))
-
-        titles = [t for _s, t, _e in cfg.ROLES]
-        cur_role = self.settings.get("role", "companion_radio_ble")
-        self.role_slug = cur_role
-        cur_title = cfg.role_title(cur_role)
-        self.role_var = tk.StringVar(value=cur_title)
-        self.role_menu = tk.OptionMenu(root, self.role_var, *titles,
-                                       command=self.on_role_change)
-        self.role_menu.configure(bg=PANEL2, fg=TEXT, activebackground=BORDER,
-                                 activeforeground=TEXT, bd=0, relief="flat",
-                                 highlightthickness=0, font=self.f_meta,
-                                 anchor="w", padx=X(8))
-        self.role_menu["menu"].configure(bg=PANEL2, fg=TEXT,
-                                         activebackground=BORDER,
-                                         activeforeground=TEXT,
-                                         font=self.f_meta)
-        self.role_menu.place(x=X(24), y=X(84), width=X(318), height=X(27))
-
-        self._mk_btn(root, "Скачать с GitHub", self.download_online,
-                     X(354), X(84), X(196), X(27))
-        self._mk_btn(root, "Обновить", self.rescan_firmware,
-                     X(562), X(84), X(96), X(27))
-        self._mk_btn(root, "Выбрать…", self.choose_file,
-                     X(666), X(84), X(90), X(27))
-
-        self.fw_lbl = tk.Label(root, text="", bg=BG, fg=DIM, font=self.f_meta,
-                               anchor="w")
-        self.fw_lbl.place(x=X(24), y=X(118), width=X(732), height=X(18))
-
-        # drop zone --------------------------------------------------------
-        self.zone_w = X(780 - 48)
-        self.zone_h = X(84)
-        self.zone = tk.Canvas(root, bg=BG, highlightthickness=0, bd=0,
-                              width=self.zone_w, height=self.zone_h,
-                              cursor="hand2")
-        self.zone.place(x=X(24), y=X(146), width=self.zone_w,
-                        height=self.zone_h)
-        self.zone.bind("<Button-1>", lambda _e: self.choose_file())
-        self.zone.bind("<Enter>", self._on_zone_enter)
-        self.zone.bind("<Leave>", self._on_zone_leave)
-
-        # file + progress --------------------------------------------------
-        self.name_lbl = tk.Label(root, text="файл не выбран", bg=BG, fg=FAINT,
-                                 font=self.f_meta, anchor="w")
-        self.name_lbl.place(x=X(24), y=X(240), width=X(520), height=X(18))
-        self.meta_lbl = tk.Label(root, text="", bg=BG, fg=FAINT,
-                                 font=self.f_meta, anchor="e")
-        self.meta_lbl.place(x=X(550), y=X(240), width=X(206), height=X(18))
-
-        self.bar = tk.Canvas(root, bg=BG, highlightthickness=0, bd=0,
-                             height=X(6))
-        self.bar.place(x=X(24), y=X(264), width=self.zone_w, height=X(6))
-
-        self.status_lbl = tk.Label(root, text="", bg=BG, fg=DIM,
-                                   font=self.f_status, anchor="w")
-        self.status_lbl.place(x=X(24), y=X(276), width=X(640), height=X(18))
-        self.pct_lbl = tk.Label(root, text="", bg=BG, fg=DIM,
-                                font=self.f_status, anchor="e")
-        self.pct_lbl.place(x=X(672), y=X(276), width=X(84), height=X(18))
-
-        # settings ---------------------------------------------------------
-        tk.Frame(root, bg=BORDER, height=X(1), bd=0).place(
-            x=X(24), y=X(304), width=self.zone_w, height=X(1))
-        tk.Label(root, text="НАСТРОЙКИ НОДЫ", bg=BG, fg=FAINT,
-                 font=self.f_badge).place(x=X(24), y=X(312))
-
-        self.vars: dict[str, object] = {}
-        self._field(root, "Имя ноды", "name", 0, 0, "пусто — не менять", 160)
-        self._field(root, "Частота, МГц", "freq", 0, 1, "", 160)
-        self._field(root, "Полоса, кГц", "bw", 0, 2, "", 160)
-        self._field(root, "SF", "sf", 0, 3, "5..12", 160)
-        self._field(root, "CR", "cr", 0, 4, "5..8", 160)
-        self._field(root, "Мощность, dBm", "tx", 1, 0, "-9..22", 110)
-        self._field(root, "Ёмкость, мАч", "capacity", 1, 1, "1000..10000", 110)
-        self._module_field(root, 1, 2)
-        self._field(root, "Коэф. АЦП", "adc", 1, 3, "1.750", 110)
-
-        self.send_var = tk.BooleanVar(
-            value=bool(self.settings.get("send_after_flash", True)))
-        tk.Checkbutton(root, text="отправлять настройки после прошивки",
-                       variable=self.send_var, command=self._on_send_toggle,
-                       bg=BG, fg=DIM, activebackground=BG,
-                       activeforeground=TEXT, selectcolor=PANEL2,
-                       font=self.f_meta, anchor="w").place(
-            x=X(400), y=X(456), width=X(346), height=X(24))
-
-        self._mk_btn(root, "ПРОШИТЬ", self.flash_current,
-                     X(24), X(494), X(232), X(34), ACCENT_DARK, TEXT)
-        self._mk_btn(root, "Отправить настройки", self.send_settings_now,
-                     X(268), X(494), X(240), X(34))
-        self._mk_btn(root, "Собрать OTA-ZIP", self.build_ota,
-                     X(520), X(494), X(236), X(34), OTA, OTA_TXT)
-
-        # divider + log ----------------------------------------------------
-        tk.Frame(root, bg=BORDER, height=X(1), bd=0).place(
-            x=X(24), y=X(546), width=self.zone_w, height=X(1))
-        tk.Label(root, text="ЛОГ", bg=BG, fg=FAINT,
-                 font=self.f_badge).place(x=X(24), y=X(554))
-
-        self.logw = tk.Text(root, bg=PANEL, fg=DIM, bd=0, relief="flat",
-                            highlightthickness=0, wrap="word",
-                            font=self.f_log, padx=X(10), pady=X(8),
-                            insertbackground=TEXT, selectbackground=BLUE_DARK,
-                            cursor="arrow", spacing1=X(1), spacing3=X(1))
-        self.logw.place(x=X(24), y=X(568), width=self.zone_w, height=X(316))
-        self.logw.tag_configure("time", foreground=FAINT)
-        self.logw.tag_configure("dim", foreground=FAINT)
-        self.logw.tag_configure("info", foreground=DIM)
-        self.logw.tag_configure("ok", foreground=ACCENT)
-        self.logw.tag_configure("warn", foreground=WARN)
-        self.logw.tag_configure("err", foreground=ERR)
-        self.logw.tag_configure("file", foreground=OTA)
-        self.logw.configure(state="disabled")
-
-        self._draw_progress()
-        self._draw_badge()
-        self._redraw_zone()
-        self.rescan_firmware()
-
-    # ------------------------------------------------------------ виджеты
-    def _mk_btn(self, parent, text, command, x, y, w, h,
-                bg=PANEL2, fg=TEXT):
-        btn = self.tk.Button(parent, text=text, command=command,
-                             bg=bg, fg=fg, activebackground=BORDER,
-                             activeforeground=TEXT, bd=0, relief="flat",
-                             highlightthickness=0, font=self.f_meta,
-                             cursor="hand2")
-        btn.place(x=x, y=y, width=w, height=h)
-        return btn
-
-    def _field(self, parent, label, key, col, row, hint, width):
-        tk = self.tk
-        base_x = 24 if col == 0 else 400
-        y = 338 + row * 34
-        tk.Label(parent, text=label, bg=BG, fg=DIM, font=self.f_meta,
-                 anchor="w").place(x=X(base_x), y=X(y), width=X(146),
-                                   height=X(20))
-        v = tk.StringVar(value=str(self.settings.get(key, "")))
-        ent = tk.Entry(parent, textvariable=v, bg=PANEL2, fg=TEXT,
-                       insertbackground=TEXT, bd=0, relief="flat",
-                       highlightthickness=1, highlightbackground=BORDER,
-                       highlightcolor=ACCENT, font=self.f_meta)
-        ent.place(x=X(base_x + 150), y=X(y - 2), width=X(width), height=X(23))
-        if hint:
-            tk.Label(parent, text=hint, bg=BG, fg=FAINT, font=self.f_meta,
-                     anchor="w").place(x=X(base_x + 150 + width + 6), y=X(y),
-                                       width=X(84), height=X(20))
-        v.trace_add("write", lambda *_a: self._on_setting_changed())
-        self.vars[key] = v
-
-    def _module_field(self, parent, col, row):
-        tk = self.tk
-        base_x = 400
-        y = 338 + row * 34
-        tk.Label(parent, text="Модуль", bg=BG, fg=DIM, font=self.f_meta,
-                 anchor="w").place(x=X(base_x), y=X(y), width=X(146),
-                                   height=X(20))
-        titles = [t for _i, t in cfg.MODULES]
-        cur = int(self.settings.get("module", 0))
-        cur_title = next((t for i, t in cfg.MODULES if i == cur), titles[0])
-        self.module_var = tk.StringVar(value=cur_title)
-        om = tk.OptionMenu(parent, self.module_var, *titles,
-                           command=lambda _v: self._on_setting_changed())
-        om.configure(bg=PANEL2, fg=TEXT, activebackground=BORDER,
-                     activeforeground=TEXT, bd=0, relief="flat",
-                     highlightthickness=0, font=self.f_meta, anchor="w")
-        om["menu"].configure(bg=PANEL2, fg=TEXT, activebackground=BORDER,
-                             activeforeground=TEXT, font=self.f_meta)
-        om.place(x=X(base_x + 150), y=X(y - 3), width=X(160), height=X(25))
-
-    # -------------------------------------------------------- настройки/файл
-    def _collect_settings(self) -> dict:
-        s = dict(self.settings)
-        for key, v in self.vars.items():
-            raw = str(v.get()).strip().replace(",", ".")
-            if key == "name":
-                s["name"] = str(v.get()).strip()
-                continue
-            if raw == "":
-                continue
-            try:
-                s[key] = float(raw) if key in ("freq", "bw", "adc") else int(raw)
-            except ValueError:
-                pass
-        s["module"] = next((i for i, t in cfg.MODULES
-                            if t == self.module_var.get()), 0)
-        s["send_after_flash"] = bool(self.send_var.get())
-        return s
-
-    def _on_setting_changed(self) -> None:
-        self.settings = self._collect_settings()
-        cfg.save_settings(self.settings)
-
-    def _on_send_toggle(self) -> None:
-        self.settings["send_after_flash"] = bool(self.send_var.get())
-        cfg.save_settings(self.settings)
-
-    def on_role_change(self, title: str) -> None:
-        for slug, t, _env in cfg.ROLES:
-            if t == title:
-                self.role_slug = slug
-                self.settings["role"] = slug
-                cfg.save_settings(self.settings)
-                break
-        self.rescan_firmware()
-
-    def _env(self) -> str:
-        return cfg.ROLE_ENVS.get(self.role_slug, "")
-
-    def rescan_firmware(self) -> None:
-        self.firmware = cfg.scan_firmware()
-        env = self._env()
-        path = self.firmware.get(env)
-        if path:
-            self._apply_file(path)
-            return
-        self.current_file = None
-        self.fw_lbl.configure(
-            text=f"нет файла для роли «{cfg.role_title(self.role_slug)}» — "
-                 f"положи .uf2 в firmware или нажми «Скачать с GitHub»",
-            fg=WARN)
-
-    def _apply_file(self, path: str) -> None:
-        env = cfg.role_env_from_filename(os.path.basename(path)) or self._env()
-        self.current_file = path
-        self.current_env = env
-        self.settings["last_env"] = env
-        cfg.save_settings(self.settings)
-        title = cfg.role_title(cfg.role_for_env(env) or "")
-        self.fw_lbl.configure(text=f"{title} · {os.path.basename(path)}",
-                              fg=ACCENT)
-        try:
-            info = Uf2Info.load(path)
-        except (OSError, Uf2Error) as e:
-            self._fail(str(e))
-            return
-        self.info = info
-        self.file_path = path
-        self.name_lbl.configure(text=elide(os.path.basename(path),
-                                           self.f_name, X(505)),
-                                fg=TEXT, font=self.f_name)
-        self.meta_lbl.configure(
-            text=f"{fmt_size(info.size)} · {info.num_blocks} бл.", fg=FAINT)
-
-    def choose_file(self) -> None:
-        if self.busy:
-            return
-        path = self.filedialog.askopenfilename(
-            parent=self.root, title="Выбери прошивку .uf2",
-            filetypes=[("UF2 firmware", "*.uf2"), ("Все файлы", "*.*")])
-        if path:
-            self._apply_file(path)
-
-    def download_online(self) -> None:
-        if self.busy:
-            return
-        env = self._env()
-        if not env:
-            return
-        self.log("читаю манифест с GitHub…", "info")
-
-        def work() -> None:
-            try:
-                man = cfg.fetch_manifest()
-            except Exception as e:  # noqa: BLE001
-                self.q.put(("log", f"манифест недоступен: {e}", "err"))
-                return
-            files = man.get("files") if isinstance(man.get("files"), dict) else {}
-            url = files.get(env)
-            ver = man.get("version", "?")
-            if not url:
-                self.q.put(("log", f"в манифесте v{ver} нет файла для этой роли",
-                            "err"))
-                return
-            self.q.put(("log", f"манифест v{ver}: качаю {os.path.basename(url)}",
-                        "info"))
-            path = cfg.download_firmware(
-                env, url, log=lambda m: self.q.put(("log", m, "dim")))
-            if path:
-                self.q.put(("online_ready", path))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def on_drop(self, paths: list[str]) -> None:
-        now = time.monotonic()
-        if now - self._last_drop_at < 0.35:
-            return
-        self._last_drop_at = now
-        if self.busy:
-            self.log("идёт запись — дождись окончания", "warn")
-            return
-        uf2 = next((p for p in paths if p.lower().endswith(".uf2")
-                    and os.path.isfile(p)), None)
-        if not uf2:
-            self._fail("Нужен файл .uf2")
-            return
-        self._apply_file(uf2)
-        if self.info is None:
-            return
-        if self.info.family != UF2_FAMILY_NRF52840:
-            self._fail(f"это UF2 для {family_name(self.info.family)}, "
-                       f"а нужен nRF52840")
-            return
-        self.progress = 0.0
-        self.pct_lbl.configure(text="0%")
-        self.log(f"файл: {os.path.basename(uf2)}", "info")
-        self._draw_progress()
-        if len(self.vols) == 1:
-            self.start_flash(self.vols[0])
-        else:
-            self.arm()
-
-    def flash_current(self) -> None:
-        if self.busy:
-            return
-        if not getattr(self, "current_file", None):
-            self.rescan_firmware()
-        if not getattr(self, "current_file", None):
-            self.log("нет прошивки для этой роли", "err")
-            return
-        self.log(f"прошиваю: {cfg.role_title(self.role_slug)}", "ok")
-        self.on_drop([self.current_file])
-
-    # ------------------------------------------------------------- OTA
-    def build_ota(self) -> None:
-        """Собирает OTA-пакет (DFU zip) из выбранного .uf2 — для обновления
-        по воздуху через bootloader OTAFIX и приложения Nordic DFU."""
-        if self.busy:
-            self.log("идёт операция — дождись окончания", "warn")
-            return
-        if not getattr(self, "current_file", None):
-            self.rescan_firmware()
-        path = getattr(self, "current_file", None)
-        if not path:
-            self.log("нет файла прошивки: положи .uf2 в папку firmware "
-                     "или нажми «Скачать с GitHub»", "err")
-            self._status("для OTA нужен .uf2 — его нет")
-            return
-        if self.info is not None and self.info.family != UF2_FAMILY_NRF52840:
-            self._fail(f"это UF2 для {family_name(self.info.family)}, "
-                       f"а нужен nRF52840")
-            return
-
-        env = getattr(self, "current_env", None) or self._env() or "firmware"
-        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
-        out_dir = os.path.dirname(os.path.abspath(path)) or app_dir()
-        out = os.path.join(out_dir, f"{env}-ota-{stamp}.zip")
-
-        self.busy = True
-        self._set_progress(0.03)
-        self._status("собираю OTA-пакет…")
-        self.log(f"OTA: {os.path.basename(path)}", "ok")
-        self.log("настройки внутрь пакета не попадают — после OTA их "
-                 "писать в ноду отдельно", "dim")
-
-        def work() -> None:
-            try:
-                self.q.put(("log", "разбираю UF2 по блокам…", "dim"))
-                self.q.put(("ota_progress", 0.12))
-                stats = build_dfu_zip(
-                    path, out,
-                    progress=lambda p: self.q.put(
-                        ("ota_progress", 0.12 + 0.82 * p)))
-                self.q.put(("ota_done", (True, out, stats)))
-            except Exception as e:  # noqa: BLE001
-                self.q.put(("ota_done", (False, str(e), None)))
-
-        threading.Thread(target=work, daemon=True).start()
-
-
-    # ------------------------------------------------------------- COM
-    def _wait_nrf_port(self, timeout: float = 15.0) -> str | None:
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            ports = cfg.nrf_ports()
-            if ports:
-                return ports[0]
-            time.sleep(0.5)
-        return None
-
-    def _send_settings_thread(self, port: str, prefix: str) -> None:
-        cmds = cfg.build_commands(self.settings)
-        total = len(cmds)
-
-        def progress(p: float) -> None:
-            self.q.put(("settings_progress", prefix + (1.0 - prefix) * p))
-
-        ok = cfg.send_commands_batch(
-            port, cmds, progress=progress,
-            log=lambda m: self.q.put(("log", m, "dim")))
-        self.q.put(("settings_done", ok))
-
-    def _start_settings_send(self) -> None:
-        if not self.settings.get("send_after_flash", True):
-            return
-        self._set_progress(0.74)
-        self._status("ищу ноду — НЕ ОТКЛЮЧАЙ плату")
-        self.log("ищу ноду среди портов nRF (VID 239A/1915)…", "info")
-
-        def work() -> None:
-            port = self._wait_nrf_port(15.0)
-            if not port:
-                self.q.put(("log", "нода не появилась — настройки НЕ отправлены. "
-                                   "Проверь кабель и нажми «Отправить настройки»", "err"))
-                self.q.put(("settings_done", False))
-                return
-            self.q.put(("log", f"порт {port}: отправляю настройки пачкой", "ok"))
-            self.q.put(("settings_progress", 0.78))
-            self._send_settings_thread(port, 0.78)
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def send_settings_now(self) -> None:
-        if self.busy:
-            self.log("идёт запись — дождись окончания", "warn")
-            return
-        ports = cfg.nrf_ports()
-        if not ports:
-            self.log("портов nRF не видно: подключи плату по USB", "err")
-            return
-        port = ports[0]
-        self.settings = self._collect_settings()
-        cfg.save_settings(self.settings)
-        self.log(f"отправляю настройки на {port}", "info")
-        self._set_progress(0.05)
-        threading.Thread(target=self._send_settings_thread,
-                         args=(port, 0.05), daemon=True).start()
-
-
-    def _draw_logo(self, c, w: int, h: int) -> None:
-        tk = self.tk
-        c.delete("all")
-        cx, cy = w / 2, h / 2
-        r = X(9)
-        # корпус чипа
-        self._poly_round(c, cx - r, cy - r, cx + r, cy + r, X(3),
-                         fill="", outline=ACCENT, width=max(1, X(1.6)))
-        # выводы
-        pin = X(3)
-        for i in (-1, 1):
-            off = i * X(4)
-            c.create_line(cx - r - pin, cy + off, cx - r, cy + off,
-                          fill=ACCENT, width=max(1, X(1.4)))
-            c.create_line(cx + r, cy + off, cx + r + pin, cy + off,
-                          fill=ACCENT, width=max(1, X(1.4)))
-            c.create_line(cx + off, cy - r - pin, cx + off, cy - r,
-                          fill=ACCENT, width=max(1, X(1.4)))
-            c.create_line(cx + off, cy + r, cx + off, cy + r + pin,
-                          fill=ACCENT, width=max(1, X(1.4)))
-        # стрелка внутрь
-        c.create_line(cx, cy - X(4), cx, cy + X(3), fill=ACCENT,
-                      width=max(1, X(1.5)), capstyle=tk.ROUND)
-        c.create_line(cx - X(3), cy, cx, cy + X(4), fill=ACCENT,
-                      width=max(1, X(1.5)), capstyle=tk.ROUND)
-        c.create_line(cx + X(3), cy, cx, cy + X(4), fill=ACCENT,
-                      width=max(1, X(1.5)), capstyle=tk.ROUND)
-
-    @staticmethod
-    def _round_points(x1, y1, x2, y2, r, steps=6):
-        pts = []
-        corners = (
-            (x1 + r, y1 + r, 180, 270),
-            (x2 - r, y1 + r, 270, 360),
-            (x2 - r, y2 - r, 0, 90),
-            (x1 + r, y2 - r, 90, 180),
-        )
-        for cx, cy, a0, a1 in corners:
-            for i in range(steps + 1):
-                a = math.radians(a0 + (a1 - a0) * i / steps)
-                pts.extend((cx + r * math.cos(a), cy + r * math.sin(a)))
-        return pts
-
-    def _poly_round(self, c, x1, y1, x2, y2, r, fill="", outline="",
-                    width=1, dash=None):
-        pts = self._round_points(x1, y1, x2, y2, max(0, r))
-        if fill:
-            c.create_polygon(pts, fill=fill, outline="")
-        if outline:
-            if dash:
-                c.create_line(pts + pts[:2], fill=outline, width=width,
-                              dash=dash, joinstyle=self.tk.ROUND)
-            else:
-                c.create_polygon(pts, fill="", outline=outline, width=width,
-                                 joinstyle=self.tk.ROUND)
-
-    def _draw_progress(self) -> None:
-        c = self.bar
-        c.delete("all")
-        if self.info is None and self.progress <= 0:
-            return
-        w = self.zone_w
-        h = X(6)
-        self._poly_round(c, 0, 0, w, h, h / 2, fill=PANEL2)
-        p = max(0.0, min(1.0, self.progress))
-        if p > 0:
-            if self.state == "error":
-                col = ERR
-            elif self.state == "warn":
-                col = WARN
-            else:
-                col = ACCENT
-            fw = max(h, w * p)
-            fw = min(w, fw)
-            self._poly_round(c, 0, 0, fw, h, h / 2, fill=col)
-
-    def _draw_badge(self) -> None:
-        c = self.badge
-        c.delete("all")
-        text, dot, fg = self._badge_data()
-        tw = self.f_badge.measure(text)
-        w = tw + X(30)
-        h = X(26)
-        # канвас шире — прижимаем пилюлю вправо
-        x1 = X(150) - w
-        self._poly_round(c, x1, 0, X(150), h, h / 2, fill=PANEL2, outline=BORDER)
-        c.create_oval(x1 + X(11), h / 2 - X(3), x1 + X(17), h / 2 + X(3),
-                      fill=dot, outline="")
-        c.create_text(x1 + X(22), h / 2, text=text, anchor="w",
-                      fill=fg, font=self.f_badge)
-
-    def _badge_data(self):
-        if self.state == "flash":
-            return f"запись {int(self.progress * 100)}%", BLUE, TEXT
-        if self.state == "armed":
-            return "жду плату", WARN, TEXT
-        if self.state == "done":
-            return "готово", ACCENT, TEXT
-        if self.state == "warn":
-            return "проверь", WARN, TEXT
-        if self.state == "error":
-            return "ошибка", ERR, TEXT
-        if len(self.vols) == 1:
-            v = self.vols[0]
-            return f"{v.title} · {v.where}", ACCENT, TEXT
-        if len(self.vols) > 1:
-            return f"{len(self.vols)} платы", WARN, TEXT
-        return "нет платы", FAINT, DIM
-
-    def _zone_style(self):
-        if self.state == "flash":
-            return BLUE, BLUE, "Пишу прошивку…"
-        if self.state == "armed":
-            border = WARN if self._pulse_on else WARN_DARK
-            return border, WARN, "Жду плату…"
-        if self.state == "done":
-            return ACCENT, ACCENT, "Готово"
-        if self.state == "warn":
-            return WARN, WARN, "Записано"
-        if self.state == "error":
-            return ERR, ERR, "Не вышло"
-        if self._hover:
-            return BORDER_HOVER, ACCENT, "Перетащи сюда .uf2"
-        return BORDER, ACCENT, "Перетащи сюда .uf2"
-
-    def _zone_sub(self) -> str:
-        if self.state == "flash":
-            if self.info:
-                return f"{int(self.progress * 100)}% · {fmt_size(self.info.size)}"
-            return "…"
-        if self.state == "armed":
-            if len(self.vols) > 1:
-                return "подключено несколько плат — оставь одну"
-            return "дважды нажми Reset на плате"
-        if self.state == "done":
-            return "плата перезагружается в прошивку"
-        if self.state == "warn":
-            return "нажми Reset, если плата не запустилась"
-        if self.state == "error":
-            text = self.last_error or "попробуй ещё раз"
-            return elide(text, self.f_zone2, self.zone_w - X(30))
-        if self.info:
-            return "нажми или перетащи другой файл"
-        return "или нажми, чтобы выбрать файл"
-
-    def _redraw_zone(self) -> None:
-        c = self.zone
-        tk = self.tk
-        c.delete("all")
-        w, h = self.zone_w, self.zone_h
-        border, icon_col, title = self._zone_style()
-        self._poly_round(c, 0, 0, w - 1, h - 1, X(16), fill=PANEL)
-        self._poly_round(c, 0, 0, w - 1, h - 1, X(16), outline=border,
-                         width=X(1.5 if self.state != "idle" else 1),
-                         dash=None if self.state != "idle" else (X(4), X(5)))
-
-        cx = w / 2
-        cy = X(60)
-        # иконка «скачать в лоток»
-        c.create_line(cx, cy - X(20), cx, cy + X(2), fill=icon_col,
-                      width=X(2.2), capstyle=tk.ROUND)
-        c.create_line(cx - X(8), cy - X(6), cx, cy + X(3), fill=icon_col,
-                      width=X(2.2), capstyle=tk.ROUND)
-        c.create_line(cx + X(8), cy - X(6), cx, cy + X(3), fill=icon_col,
-                      width=X(2.2), capstyle=tk.ROUND)
-        c.create_line(cx - X(17), cy + X(8), cx - X(17), cy + X(18),
-                      fill=icon_col, width=X(2.2), capstyle=tk.ROUND)
-        c.create_line(cx - X(17), cy + X(18), cx + X(17), cy + X(18),
-                      fill=icon_col, width=X(2.2), capstyle=tk.ROUND)
-        c.create_line(cx + X(17), cy + X(8), cx + X(17), cy + X(18),
-                      fill=icon_col, width=X(2.2), capstyle=tk.ROUND)
-
-        c.create_text(cx, X(124), text=title, fill=TEXT, font=self.f_zone,
-                      anchor="center")
-        self._zone_sub_id = c.create_text(
-            cx, X(149), text=self._zone_sub(), fill=DIM,
-            font=self.f_zone2, anchor="center", width=w - X(30))
-
-    # ------------------------------------------------------------- state
-    def _set_state(self, state: str) -> None:
-        self.state = state
-        self._redraw_zone()
-        self._draw_badge()
-        self._draw_progress()
-
-    def _refresh_idle(self) -> None:
-        if self.busy or self.state != "idle":
-            return
-        if time.monotonic() < self._status_hold_until:
-            return
-        if len(self.vols) == 1:
-            v = self.vols[0]
-            self._status(f"плата: {v.title} · {v.where} · {v.bootloader or 'bootloader'}")
-        elif len(self.vols) > 1:
-            self._status("подключено несколько плат — оставь одну в режиме загрузчика")
-        else:
-            self._status("плата не найдена — подключи и дважды нажми Reset")
-        self._draw_badge()
-
-    def _status(self, text: str) -> None:
-        self.status_text = text
-        shown = elide(text, self.f_status, X(486))
-        self.status_lbl.configure(text=shown)
-
-    def _status_hold(self, text: str, seconds: float = 8.0) -> None:
-        """Статус, который не затирается фоновым опросом плат (итог операции)."""
-        self._status_hold_until = time.monotonic() + seconds
-        self._status(text)
-
-    def _set_progress(self, value: float) -> None:
-        self.progress = max(0.0, min(1.0, value))
-        self._draw_progress()
-        self.pct_lbl.configure(text=f"{int(self.progress * 100)}%")
-        self._draw_badge()
-        if self.state == "flash" and self._zone_sub_id is not None:
-            self.zone.itemconfigure(self._zone_sub_id, text=self._zone_sub())
-
-    # ------------------------------------------------------------- logging
-    def log(self, message: str, level: str = "info") -> None:
-        ts = datetime.now().strftime("%H:%M:%S")
-        try:
-            self.logw.configure(state="normal")
-            self.logw.insert("end", ts + "  ", "time")
-            self.logw.insert("end", message + "\n", level)
-            lines = int(self.logw.index("end-1c").split(".")[0])
-            if lines > 500:
-                self.logw.delete("1.0", "101.0")
-            self.logw.see("end")
-            self.logw.configure(state="disabled")
-        except Exception:
-            pass
-        err = self._log_to_file(message, level)
-        if err and not self._log_err_shown:
-            self._log_err_shown = True
-            try:
-                self.logw.configure(state="normal")
-                self.logw.insert("end", f"лог-файл: {err}\n", "err")
-                self.logw.see("end")
-                self.logw.configure(state="disabled")
-            except Exception:
-                pass
-
-    def _log_to_file(self, message: str, level: str) -> str | None:
-        line = f"{datetime.now():%Y-%m-%d %H:%M:%S} [{level}] {message}\n"
-        candidates: list[str] = [os.path.join(app_dir(), "darkflasher.log")]
-        base = os.environ.get("LOCALAPPDATA")
-        if base:
-            candidates.append(os.path.join(base, "DarkFlasher", "darkflasher.log"))
-        temp = os.environ.get("TEMP")
-        if temp:
-            candidates.append(os.path.join(temp, "darkflasher.log"))
-
-        last: Exception | None = None
-        for path in candidates:
-            try:
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                if os.path.exists(path) and os.path.getsize(path) > 512 * 1024:
-                    try:
-                        os.replace(path, path + ".1")
-                    except OSError:
-                        pass
-                with open(path, "a", encoding="utf-8") as f:
-                    f.write(line)
-                return None
-            except OSError as e:
-                last = e
-        if last is None:
-            return "нет доступного пути для лога"
-        return f"{type(last).__name__}: {last}"
-
-    def _log_file_banner(self) -> None:
-        self.log(f"{APP_NAME} {APP_VERSION} · nRF52 UF2", "ok")
-        self.log("перетащи .uf2 в окно или нажми на него", "dim")
-
-    # ------------------------------------------------------------- actions
-    def choose_file(self) -> None:
-        if self.busy:
-            return
-        path = self.filedialog.askopenfilename(
-            parent=self.root, title="Выбери прошивку .uf2",
-            filetypes=[("UF2 firmware", "*.uf2"), ("Все файлы", "*.*")])
-        if path:
-            self.on_drop([path])
-
-    def on_drop(self, paths: list[str]) -> None:
-        now = time.monotonic()
-        if now - self._last_drop_at < 0.35:
-            return
-        self._last_drop_at = now
-        if self.busy:
-            self.log("идёт запись — дождись окончания", "warn")
-            return
-        uf2 = next((p for p in paths if p.lower().endswith(".uf2")
-                    and os.path.isfile(p)), None)
-        if not uf2:
-            self._fail("Нужен файл .uf2")
-            return
-        try:
-            info = Uf2Info.load(uf2)
-        except (OSError, Uf2Error) as e:
-            self._fail(str(e))
-            return
-        if info.family != UF2_FAMILY_NRF52840:
-            self._fail(f"это UF2 для {family_name(info.family)}, а нужен nRF52840")
-            return
-
-        self.info = info
-        self.file_path = uf2
-        self.progress = 0.0
-        self.pct_lbl.configure(text="0%")
-        name = os.path.basename(uf2)
-        self.name_lbl.configure(text=elide(name, self.f_name, X(378)),
-                                fg=TEXT, font=self.f_name)
-        self.meta_lbl.configure(
-            text=f"{fmt_size(info.size)} · {info.num_blocks} бл. · {family_name(info.family)}",
-            fg=FAINT)
-        self.log(f"файл: {name}", "info")
-        self.log(f"{fmt_size(info.size)} · {info.num_blocks} блоков · {family_name(info.family)} · "
-                 f"база 0x{info.base_addr:08X} · end 0x{info.magic_end:08X}", "info")
-        self._draw_progress()
-
-        if len(self.vols) == 1:
-            self.start_flash(self.vols[0])
-        else:
-            self.arm()
-
-    def _fail(self, message: str) -> None:
-        self._stop_pulse()
-        self.info = None
-        self.file_path = None
-        self.last_error = message
-        self.progress = 0.0
-        self.name_lbl.configure(text="файл не выбран", fg=FAINT,
-                                font=self.f_meta)
-        self.meta_lbl.configure(text="")
-        self.pct_lbl.configure(text="")
-        self._set_state("error")
-        self._status(message)
-        self.log(message, "err")
-
-    def arm(self) -> None:
-        self.busy = False
-        self.pct_lbl.configure(text="")
-        self._set_state("armed")
-        if len(self.vols) > 1:
-            self._status("подключено несколько плат — оставь одну в режиме загрузчика")
-            self.log("подключено несколько плат — оставь одну", "warn")
-        else:
-            self._status("жду плату в режиме загрузчика — дважды нажми Reset")
-            self.log("жду плату в режиме загрузчика…", "warn")
-        self._start_pulse()
-
-    def start_flash(self, vol: Uf2Volume) -> None:
-        if self.busy or self.info is None:
-            return
-        self.busy = True
-        self._stop_pulse()
-        self.watcher.pause()
-        self.progress = 0.0
-        self.pct_lbl.configure(text="0%")
-        self._set_state("flash")
-        self._status(f"пишу {fmt_size(self.info.size)} на {vol.title} · {vol.where}")
-        self.log(f"плата: {vol.title} · {vol.where} · {vol.bootloader or 'bootloader ?'}", "ok")
-        self.log(f"пишу {fmt_size(self.info.size)}…", "info")
-        FlashJob(self.q, self.info, vol).start()
-
-    def _start_pulse(self) -> None:
-        self._stop_pulse()
-        self._pulse_on = False
-
-        def tick():
-            if self.state != "armed":
-                return
-            self._pulse_on = not self._pulse_on
-            self._redraw_zone()
-            self._pulse_job = self.root.after(650, tick)
-
-        self._pulse_job = self.root.after(650, tick)
-
-    def _stop_pulse(self) -> None:
-        if self._pulse_job is not None:
-            try:
-                self.root.after_cancel(self._pulse_job)
-            except Exception:
-                pass
-            self._pulse_job = None
-
-    # ------------------------------------------------------------- events
-    def _pump(self) -> None:
-        if self._closed:
-            return
-        try:
-            while True:
-                event = self.q.get_nowait()
-                kind = event[0]
-                if kind == "volumes":
-                    self.on_volumes(event[1])
-                elif kind == "progress":
-                    self.on_progress(event[1], event[2])
-                elif kind == "flash":
-                    self.on_flash(event[1])
-                elif kind == "status":
-                    self._status(event[1])
-                elif kind == "log":
-                    self.log(event[1], event[2])
-                elif kind == "online_ready":
-                    self.log("прошивка скачана", "ok")
-                    self._apply_file(event[1])
-                elif kind == "ota_progress":
-                    self._set_progress(event[1])
-                elif kind == "ota_done":
-                    ok, payload, stats = event[1]
-                    self.busy = False
-                    if ok and stats:
-                        self._set_progress(1.0)
-                        self._status_hold(f"OTA-пакет готов: "
-                                          f"{os.path.basename(payload)}")
-                        self.log(f"образ {fmt_size(stats['image'])} · "
-                                 f"{stats['blocks']} блоков · база "
-                                 f"0x{stats['base']:08X} · crc16 "
-                                 f"0x{stats['crc']:04X}", "dim")
-                        self.log(f"пакет {fmt_size(stats['size'])} "
-                                 f"сохранён: {payload}", "file")
-                    else:
-                        self._set_progress(0.0)
-                        self._status("OTA-пакет не собран")
-                        self.log(f"OTA: {payload}", "err")
-                elif kind == "settings_progress":
-                    self._set_progress(event[1])
-                elif kind == "settings_done":
-                    if event[1]:
-                        self._set_progress(1.0)
-                        self.log("настройки записаны в ноду", "ok")
-                        self._status("готово: прошивка и настройки на месте")
-                    else:
-                        self._status("прошивка записана, настройки — не полностью")
-                        self.log("настройки записаны не полностью — "
-                                 "проверь лог", "warn")
-        except queue.Empty:
-            pass
-        self.root.after(60, self._pump)
-
-    def on_volumes(self, vols: list[Uf2Volume]) -> None:
-        self.vols = vols
-        if self.busy:
-            return
-        if self.state == "armed":
-            if len(vols) == 1:
-                self.start_flash(vols[0])
-            elif len(vols) > 1:
-                self._status("подключено несколько плат — оставь одну")
-                self._redraw_zone()
-            else:
-                self._status("жду плату в режиме загрузчика — дважды нажми Reset")
-                self._redraw_zone()
-            return
-        if self.state == "idle":
-            self._refresh_idle()
-            self._redraw_zone()
-
-    def on_progress(self, done: int, total: int) -> None:
-        if total <= 0:
-            return
-        # Запись — первая часть общего прогресса (остальное: порт и настройки).
-        self._set_progress((done / total) * 0.72)
-        self._status(f"пишу {fmt_size(done)} из {fmt_size(total)}")
-
-    def on_flash(self, res: FlashResult) -> None:
-        self.busy = False
-        self._stop_pulse()
-        self.watcher.resume()
-        if res.no_volume and self.info is not None:
-            self.log("не успел поймать диск — жду ещё раз, нажми Reset", "warn")
-            self.arm()
-            return
-        if res.ok:
-            self.progress = 1.0
-            if res.rebooted:
-                self._set_state("done")
-                self._status(f"записано за {res.elapsed:.1f} с · {fmt_size(res.written)}")
-                self.log(f"готово за {res.elapsed:.1f} с — плата перезагрузилась", "ok")
-            else:
-                self._set_state("warn")
-                self._status("файл записан, но плата не перезагрузилась — нажми Reset")
-                self.log("файл записан, но том не исчез — плата не ушла в ребут", "warn")
-            # После прошивки нода поднимает USB-CDC: пишем в неё конфигурацию.
-            self._start_settings_send()
-        else:
-            self.progress = max(0.0, res.written / res.total) if res.total else 0.0
-            short = res.message
-            if res.winerror:
-                short = f"{short} (WinError {res.winerror})"
-            self.last_error = short
-            self._set_state("error")
-            self._status(f"{short} · записано {res.percent}%")
-            self.log(f"ошибка: {short}", "err")
-            self.log(f"записано {fmt_size(res.written)} из {fmt_size(res.total)} "
-                     f"({res.percent}%)", "dim")
-            if res.winerror in (34, 1167, 21, 121):
-                self.log("похоже, плата отключилась. Проверь кабель/порт, "
-                         "дважды нажми Reset и брось файл ещё раз", "dim")
-        self.pct_lbl.configure(text=f"{int(self.progress * 100)}%")
-        self._draw_progress()
-
-    # ------------------------------------------------------------- drag&drop
-    def _install_drop_target(self) -> None:
-        """Один target на клиентское окно Tk. В WndProc — только очередь."""
-        self.root.update_idletasks()
-        hwnd = self.root.winfo_id()
-        self._drop_hwnd = hwnd
-        self._drop_olds = {}
-        self._drop_procs = []
-        proc = WNDPROC(self._wndproc)
-        old = user32.SetWindowLongPtrW(
-            hwnd, GWLP_WNDPROC, ctypes.cast(proc, ctypes.c_void_p))
-        self._drop_olds[hwnd] = old
-        self._drop_procs.append(proc)
-        shell32.DragAcceptFiles(hwnd, True)
-
-    def _wndproc(self, hwnd, msg, wparam, lparam):
-        try:
-            if msg == WM_DROPFILES:
-                # Не трогаем Tcl и shell внутри оконной процедуры:
-                # забираем HDROP позже, в обычном таймере Tk.
-                self._drop_queue.append(int(wparam))
-                return 0
-            old = self._drop_olds.get(hwnd)
-            if old:
-                return user32.CallWindowProcW(old, hwnd, msg, wparam, lparam)
-        except Exception:
-            try:
-                sys.stderr.write("wndproc error\n")
-            except Exception:
-                pass
-        return 0
-
-    def _poll_drops(self) -> None:
-        if self._closed:
-            return
-        while self._drop_queue:
-            hdrop = self._drop_queue.pop(0)
-            if hdrop in self._drop_seen:
-                continue
-            self._drop_seen.add(hdrop)
-            self.log(f"drop: WM_DROPFILES 0x{hdrop:X}", "dim")
-            try:
-                files = self._read_hdrop(hdrop)
-            finally:
-                shell32.DragFinish(hdrop)
-            self.log(f"drop: путей {len(files)}", "dim")
-            if files:
-                try:
-                    self.on_drop(files)
-                except Exception:
-                    self.log("drop: ошибка обработки — см. darkflasher-trace.log", "err")
-                    import traceback
-                    traceback.print_exc()
-        self.root.after(50, self._poll_drops)
-
-    def _read_hdrop(self, hdrop) -> list[str]:
-        count = shell32.DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
-        files: list[str] = []
-        for i in range(min(int(count), 64)):
-            length = shell32.DragQueryFileW(hdrop, i, None, 0)
-            if length <= 0 or length > 32768:
-                continue
-            buf = ctypes.create_unicode_buffer(length + 1)
-            got = shell32.DragQueryFileW(hdrop, i, buf, length + 1)
-            if got and buf.value:
-                files.append(buf.value)
-        return files
-
-    def _on_zone_enter(self, _event) -> None:
-        self._hover = True
-        if self.state == "idle":
-            self._redraw_zone()
-
-    def _on_zone_leave(self, _event) -> None:
-        self._hover = False
-        if self.state == "idle":
-            self._redraw_zone()
-
-    # ------------------------------------------------------------- misc
-    def _set_icon(self) -> None:
-        try:
-            self.root.iconbitmap(resource_path("app.ico"))
-        except Exception:
-            pass
-
-    def _dark_titlebar(self) -> None:
-        try:
-            hwnd = user32.GetParent(self.root.winfo_id())
-            value = ctypes.c_int(1)
-            for attr in (20, 19):
-                if dwmapi.DwmSetWindowAttribute(
-                        hwnd, attr, ctypes.byref(value), ctypes.sizeof(value)) == 0:
-                    break
-        except Exception:
-            pass
-
-    def on_close(self) -> None:
-        if self.busy:
-            if not self.messagebox.askyesno(
-                    "Идёт запись",
-                    "Прервать прошивку?\nПлата останется в режиме загрузчика.",
-                    parent=self.root):
-                return
-        self._closed = True
-        try:
-            self.watcher.stop()
-        except Exception:
-            pass
-        self.root.destroy()
-
-
-# --------------------------------------------------------------------------
-# CLI
-# --------------------------------------------------------------------------
 
 def _cli_print(msg: str) -> None:
     try:
@@ -2774,10 +1008,12 @@ def cli(argv: list[str]) -> int:
                 _cli_print(f"  {pct:3d}%  {fmt_size(done)} / {fmt_size(total)}")
 
         res = write_uf2(vol.path, args.flash, info.size, progress=progress)
-        if res.written >= info.size - UF2_BLOCK:
-            _cli_print("жду перезагрузку…")
+        if res.written == info.size and res.ok:
+            res.ok = True
             res.rebooted = wait_volume_gone(vol.path, REBOOT_WAIT)
-            res.ok = res.rebooted or res.written == info.size
+        elif not res.last_block_ok:
+            res.ok = False
+            res.message = "последний блок не подтверждён — прошей ещё раз"
         if res.ok:
             _cli_print(f"готово за {res.elapsed:.1f} с"
                        + (" (плата перезагрузилась)" if res.rebooted else ""))
@@ -2794,35 +1030,21 @@ def cli(argv: list[str]) -> int:
 # main
 # --------------------------------------------------------------------------
 
-def launch_gui(start_path: str | None = None) -> None:
-    global S
-    import tkinter as tk
-
-    dpi = enable_dpi()
-    S = dpi / 96.0
-    root = tk.Tk()
-    try:
-        root.tk.call("tk", "scaling", dpi / 72.0)
-    except Exception:
-        pass
-    App(root, start_path)
-    root.mainloop()
-
-
 def main() -> None:
     if sys.platform != "win32":
         raise SystemExit("Dark Flasher работает только на Windows")
     ensure_std_streams()
     argv = sys.argv[1:]
     if any(a in ("--list", "--check", "--flash", "--version", "--help", "-h")
+           or a.startswith(("--check=", "--flash="))
            for a in argv):
         try:
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
         raise SystemExit(cli(argv))
-    start = argv[0] if argv and os.path.isfile(argv[0]) else None
-    launch_gui(start)
+    from darkflasher_qt import run_gui
+    run_gui()
 
 
 if __name__ == "__main__":

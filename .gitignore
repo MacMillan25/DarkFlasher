@@ -8,4 +8,5 @@ MyFlasher/
 *.log
 *.uf2
 *.zip
+*.bak
 darkflasher.json
