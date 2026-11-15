@@ -31,10 +31,9 @@ from PyQt6.QtWidgets import (
 import darktec_cfg as cfg
 from DarkFlasher import (
     APP_NAME, APP_VERSION, FlashJob, FlashResult, Uf2Error, Uf2Info,
-    UF2_FAMILY_NRF52840, VolumeWatcher, apply_factory_cfg_to_uf2,
-    build_dfu_zip_from_image, build_erase_uf2, erase_range, family_name,
-    fmt_size, pack_factory_payload, patch_factory_cfg, uf2_to_image,
-    uf2_upload_size,
+    UF2_FAMILY_NRF52840, VolumeWatcher, apply_factory_cfg_to_uf2, blank_range,
+    build_dfu_zip_from_image, build_erase_uf2, family_name, fmt_size,
+    pack_factory_payload, patch_factory_cfg, uf2_to_image, uf2_upload_size,
 )
 
 # PIN режима разработчика. В коде лежит только PBKDF2-хеш: PBKDF2-HMAC-SHA256,
@@ -129,6 +128,15 @@ QPushButton#ota {
 QPushButton#ota:hover { background: #e6944a; }
 QPushButton#ota:pressed { background: #b86f2c; }
 QPushButton#ota:disabled { background: #6b4a26; color: #2a2018; }
+QPushButton#otafix {
+    background: #5b3a9e;
+    border-color: #7d5cc4;
+    color: #f3eeff;
+    font-weight: 700;
+}
+QPushButton#otafix:hover { background: #6a46b4; border-color: #9a79e0; }
+QPushButton#otafix:pressed { background: #4a2f82; }
+QPushButton#otafix:disabled { background: #3a2a5c; color: #b3a6cc; }
 QPushButton#danger {
     background: #2a1618;
     border-color: #6e2f35;
@@ -888,7 +896,7 @@ class MainWindow(QMainWindow):
         srv = QHBoxLayout()
         srv.setSpacing(8)
         self.btn_otafix = QPushButton("Прошить OTA FIX")
-        self.btn_otafix.setObjectName("ota")
+        self.btn_otafix.setObjectName("otafix")
         self.btn_otafix.setMinimumHeight(38)
         self.btn_otafix.setToolTip(
             "Записать загрузчик OTAFIX — обновление по Bluetooth (Nordic DFU). "
@@ -896,11 +904,12 @@ class MainWindow(QMainWindow):
         self.btn_otafix.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_otafix.clicked.connect(self.flash_otafix)
         srv.addWidget(self.btn_otafix, 1)
-        self.btn_erase = QPushButton("Очистить память ноды")
+        self.btn_erase = QPushButton("Полная очистка ноды")
         self.btn_erase.setObjectName("danger")
         self.btn_erase.setMinimumHeight(38)
         self.btn_erase.setToolTip(
-            "Стереть настройки, ключи, контакты и каналы. Прошивка остаётся")
+            "Стирает всё: прошивку, настройки, ключи, контакты и каналы. "
+            "Остаётся только загрузчик")
         self.btn_erase.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_erase.clicked.connect(self.erase_node)
         srv.addWidget(self.btn_erase, 1)
@@ -988,6 +997,8 @@ class MainWindow(QMainWindow):
                 # Оранжевым кнопкам — оранжевое свечение, остальным зелёное.
                 if isinstance(obj, QPushButton) and obj.objectName() == "ota":
                     glow = QColor(230, 148, 74, 200)
+                elif isinstance(obj, QPushButton) and obj.objectName() == "otafix":
+                    glow = QColor(150, 105, 235, 200)
                 elif isinstance(obj, QPushButton) and obj.objectName() == "danger":
                     glow = QColor(217, 106, 106, 200)
                 elif isinstance(obj, QPushButton) and obj.objectName() == "primary":
@@ -1787,43 +1798,77 @@ class MainWindow(QMainWindow):
         threading.Thread(target=work, daemon=True).start()
 
     def erase_node(self) -> None:
-        """Стирает данные ноды: настройки, ключи, контакты и каналы."""
+        """Стирает всё: данные по USB, потом прошивку через UF2."""
         if self.busy:
             self.log_msg("идёт операция — дождись окончания", "warn")
             return
-        start, end = erase_range(self.role_slug)
         answer = QMessageBox.question(
-            self, "Очистить память ноды",
-            "Стереть память ноды?\n\n"
-            "Удалятся настройки, ключи, контакты и каналы.\n"
-            "Прошивка и загрузчик останутся — нода запустится как новая.\n\n"
-            "Плату нужно перевести в режим загрузчика (Reset два раза).",
+            self, "Полная очистка ноды",
+            "Стереть всё с ноды?\n\n"
+            "Сначала прошивка сама стирает данные по USB (настройки, ключи, "
+            "контакты, каналы, привязки Bluetooth).\n"
+            "Потом стирается сама прошивка: плату нужно перевести в загрузчик "
+            "(Reset два раза).\n\n"
+            "В ноде останется только загрузчик — прошивку надо будет записать "
+            "заново.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         if answer != QMessageBox.StandardButton.Yes:
             return
-        out_dir = os.path.join(cfg.user_data_dir(), "erase")
-        out = os.path.join(out_dir, f"erase-{start:X}-{end:X}.uf2")
-        what = ("настройки, контакты и каналы"
-                if self.role_slug.startswith("companion_radio")
-                else "настройки и ключи")
-        self.log_msg(f"стираю {what}: 0x{start:X}..0x{end:X}", "warn")
         self._flash_purpose = "erase"
         self._manual_flash = False
         self._pending_flash = None
         self._set_busy(True)
         self.set_progress(0.02)
-        self.set_status("готовлю очистку памяти…")
+        self.set_status("стираю данные ноды по USB…")
+        self.log_msg("полная очистка: сначала данные по USB, потом прошивка",
+                     "warn")
+        role = self.role_slug
+        preferred = self.port
+
+        def work() -> None:
+            try:
+                ok, note = cfg.wipe_data(role, preferred=preferred)
+            except Exception as e:  # noqa: BLE001
+                ok, note = False, str(e)
+            self.q.put(("wipe_data", ok, note))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_wipe_data(self, ok: bool, note: str) -> None:
+        """Данные стёрты (или нет) — решаем, стирать ли прошивку."""
+        if ok:
+            self.log_msg(f"данные стёрты — {note}", "ok")
+            self.set_status("данные стёрты — теперь переведи плату в загрузчик")
+            self._start_blank_erase()
+            return
+        self._flash_purpose = "firmware"
+        self.set_progress(0)
+        self.set_status("очистка отменена — смотри лог")
+        self.log_msg(f"данные стереть не удалось: {note}", "err")
+        self.log_msg(
+            "полная очистка начинается с данных: их стирает сама прошивка по "
+            "USB. Прошей любую версию, дай ноде загрузиться и нажми «Полная "
+            "очистка ноды» ещё раз", "warn")
+        self._set_busy(False)
+
+    def _start_blank_erase(self) -> None:
+        """Собирает образ полной очистки и уходит в запись (ждёт загрузчик)."""
+        start, end = blank_range()
+        out_dir = os.path.join(cfg.user_data_dir(), "erase")
+        out = os.path.join(out_dir, f"blank-{start:X}-{end:X}.uf2")
+        self.log_msg(f"образ очистки: 0x{start:X}..0x{end:X} — прошивка и "
+                     f"все данные", "dim")
 
         def work() -> None:
             try:
                 os.makedirs(out_dir, exist_ok=True)
                 stats = build_erase_uf2(out, start, end)
-                self.q.put(("log", f"образ очистки: {fmt_size(stats['bytes'])} · "
-                                   f"{stats['blocks']} блоков", "dim"))
-                self.q.put(("prepared", out, "", "очистку памяти"))
+                self.q.put(("log", f"образ очистки: {fmt_size(stats['bytes'])} "
+                                   f"данных · {stats['blocks']} блоков", "dim"))
+                self.q.put(("prepared", out, "", "образ очистки"))
             except Exception as e:  # noqa: BLE001
-                self.q.put(("prepared", None, str(e), "очистку памяти"))
+                self.q.put(("prepared", None, str(e), "образ очистки"))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1834,18 +1879,18 @@ class MainWindow(QMainWindow):
         self.set_status("загрузчик OTAFIX записан — плату можно отключать")
         self.log_msg("ЗАГРУЗЧИК OTAFIX ЗАПИСАН — теперь нода умеет обновляться "
                      "по воздуху (Nordic DFU)", "ok")
-        self.log_msg("дальше: «Очистить память ноды», если нужна чистая нода, "
+        self.log_msg("дальше: «Полная очистка ноды», если нужна чистая нода, "
                      "и обычная прошивка выбранной версии", "dim")
 
     def _on_erase_done(self) -> None:
         self._flash_purpose = "firmware"
         self._set_busy(False)
         self.set_progress(1.0)
-        self.set_status("память очищена — нода запустится как новая")
-        self.log_msg("ПАМЯТЬ ОЧИЩЕНА — настройки, ключи и контакты стёрты, "
-                     "нода запустится как новая", "ok")
-        self.log_msg("прошивка осталась на месте; если нужна другая версия — "
-                     "нажми «Прошить»", "dim")
+        self.set_status("нода стёрта — остался только загрузчик")
+        self.log_msg("ПОЛНАЯ ОЧИСТКА: прошивки и данных нет, в ноде остался "
+                     "только загрузчик", "ok")
+        self.log_msg("плата в загрузчике — жми «Прошить», чтобы записать "
+                     "прошивку выбранной версии", "dim")
 
     # ------------------------------------------------------- СБОРКА ФАЙЛОВ
     def build_uf2(self) -> None:
@@ -2164,6 +2209,8 @@ class MainWindow(QMainWindow):
                         self._start_pending_flash(self.vols[0])
                 elif kind == "prepared":
                     self._on_prepared(ev[1], ev[2], ev[3])
+                elif kind == "wipe_data":
+                    self._on_wipe_data(bool(ev[1]), ev[2])
                 elif kind == "build_progress":
                     self.set_progress(ev[1])
                 elif kind == "progress":
