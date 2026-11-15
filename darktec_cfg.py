@@ -449,22 +449,18 @@ def file_sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def download_firmware(env: str, url: str, sha256: str = "",
-                      progress=None, log=print) -> str | None:
-    """Скачивает .uf2 в firmware, считает скорость и сверяет sha256.
+def _download_to(url: str, dest: str, sha256: str = "",
+                 progress=None, log=print) -> bool:
+    """Качает файл в `.part`, сверяет sha256 и подменяет dest. Ошибки — False.
 
-    Любая ошибка (папка только для чтения, обрыв, неполный файл, битый UF2)
-    возвращает None и убирает .part — вызывающий поток не должен умирать.
+    Любая проблема (обрыв, неполный файл, чужой хэш) убирает `.part` и
+    возвращает False: вызывающий поток не должен умирать.
     """
-    folder = firmware_dirs()[0]
-    dest = os.path.join(folder, env + ".uf2")
     tmp = dest + ".part"
-    log(f"скачиваю {env}…")
     h = hashlib.sha256()
     done = 0
     started = time.time()
     try:
-        os.makedirs(folder, exist_ok=True)
         with urllib.request.urlopen(url, timeout=180) as r, open(tmp, "wb") as f:
             total = int(r.headers.get("Content-Length") or 0)
             while True:
@@ -483,8 +479,6 @@ def download_firmware(env: str, url: str, sha256: str = "",
         if sha256 and got.lower() != sha256.lower():
             raise OSError(
                 f"хэш не совпал: ждали {sha256[:12]}…, получили {got[:12]}…")
-        if not _looks_like_uf2(tmp):
-            raise OSError("скачанный файл не похож на UF2")
         os.replace(tmp, dest)
     except Exception as e:  # noqa: BLE001
         log(f"не скачалось: {e}")
@@ -493,9 +487,166 @@ def download_firmware(env: str, url: str, sha256: str = "",
                 os.remove(tmp)
         except OSError:
             pass
-        return None
+        return False
     log(f"sha256 ок: {h.hexdigest()[:16]}…")
+    return True
+
+
+def download_firmware(env: str, url: str, sha256: str = "",
+                      progress=None, log=print) -> str | None:
+    """Скачивает .uf2 в firmware, считает скорость и сверяет sha256.
+
+    Любая ошибка (папка только для чтения, обрыв, неполный файл, битый UF2)
+    возвращает None — вызывающий поток не должен умирать.
+    """
+    folder = firmware_dirs()[0]
+    dest = os.path.join(folder, env + ".uf2")
+    log(f"скачиваю {env}…")
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except OSError as e:
+        log(f"не скачалось: {e}")
+        return None
+    if not _download_to(url, dest, sha256, progress, log):
+        return None
+    if not _looks_like_uf2(dest):
+        log("не скачалось: скачанный файл не похож на UF2")
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        return None
     return dest
+
+
+# ------------------------------------------- загрузчик OTAFIX (OTA по BLE)
+# OTAFIX — форк Adafruit-загрузчика с OTA DFU по Bluetooth. Плата DarkTec
+# собирается как promicro_nrf52840 (variants/darktec/platformio.ini), поэтому
+# берём её файл update-*.uf2: он ставится поверх старого загрузчика обычной
+# записью на UF2-диск.
+
+OTAFIX_API = ("https://api.github.com/repos/oltaco/"
+              "Adafruit_nRF52_Bootloader_OTAFIX/releases?per_page=20")
+OTAFIX_BOARD = "promicro_nrf52840"
+OTAFIX_DIR_NAME = "boot"
+
+
+def otafix_dirs() -> list[str]:
+    """Папки с загрузчиком: пользовательская, рядом с exe и с исходником."""
+    dirs = [
+        os.path.join(user_data_dir(), OTAFIX_DIR_NAME),
+        os.path.join(app_dir(), OTAFIX_DIR_NAME),
+        os.path.join(APP_DIR, OTAFIX_DIR_NAME),
+    ]
+    out: list[str] = []
+    for d in dirs:
+        if d not in out:
+            out.append(d)
+    return out
+
+
+def local_otafix_file() -> str | None:
+    """Готовый update-*.uf2 для платы, если его положили руками.
+
+    Такой файл приоритетнее скачивания: у автора платы может быть свой
+    загрузчик, а тут его можно подложить и не ждать GitHub.
+    """
+    found: str | None = None
+    for folder in otafix_dirs():
+        if not os.path.isdir(folder):
+            continue
+        for name in sorted(os.listdir(folder)):
+            low = name.lower()
+            if not low.endswith(".uf2") or not low.startswith("update-"):
+                continue
+            if OTAFIX_BOARD not in low:
+                continue
+            path = os.path.join(folder, name)
+            if not os.path.isfile(path) or not _looks_like_uf2(path):
+                continue
+            if found is None or os.path.getmtime(path) > os.path.getmtime(found):
+                found = path
+    return found
+
+
+def list_otafix_release(timeout: float = 15.0) -> dict | None:
+    """Последний релиз OTAFIX, в котором есть UF2 для платы DarkTec.
+
+    Возвращает tag, name, date, asset (имя файла), url, sha256 и size или
+    None, если подходящего файла в релизах нет.
+    """
+    req = urllib.request.Request(OTAFIX_API, headers={
+        "User-Agent": "DarkFlasher",
+        "Accept": "application/vnd.github+json",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = json.load(r)
+    prefix = ("update-" + OTAFIX_BOARD + "_").lower()
+    for rel in data if isinstance(data, list) else []:
+        for asset in rel.get("assets", []):
+            name = asset.get("name", "")
+            low = name.lower()
+            if not (low.startswith(prefix) and low.endswith(".uf2")):
+                continue
+            digest = asset.get("digest") or ""
+            published = rel.get("published_at") or ""
+            return {
+                "tag": rel.get("tag_name", ""),
+                "name": rel.get("name") or rel.get("tag_name", ""),
+                "date": published[:10],
+                "asset": name,
+                "url": asset.get("browser_download_url", ""),
+                "sha256": digest[7:] if digest.startswith("sha256:") else "",
+                "size": asset.get("size", 0),
+            }
+    return None
+
+
+def prepare_otafix(progress=None, log=print) -> tuple[str | None, str]:
+    """Файл загрузчика OTAFIX: локальный (приоритет) или скачанный.
+
+    Возвращает (путь, пояснение); при ошибке — (None, причина). Исключения
+    наружу не выходят, чтобы фоновый поток не падал.
+    """
+    try:
+        local = local_otafix_file()
+    except OSError:
+        local = None
+    if local:
+        return local, "локальный файл: " + os.path.basename(local)
+    try:
+        rel = list_otafix_release()
+    except Exception as e:  # noqa: BLE001
+        return None, (f"нет связи с GitHub ({e}) и нет локального "
+                      f"update-{OTAFIX_BOARD}_*.uf2 в папке boot")
+    if not rel:
+        return None, (f"в релизах OTAFIX нет файла для {OTAFIX_BOARD} — "
+                      f"положи update-*.uf2 в папку boot")
+    dest_dir = otafix_dirs()[0]
+    dest = os.path.join(dest_dir, rel["asset"])
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+    except OSError as e:
+        return None, f"папка {dest_dir} недоступна: {e}"
+    if os.path.isfile(dest) and rel.get("size") \
+            and os.path.getsize(dest) == rel["size"]:
+        if not rel.get("sha256"):
+            return dest, f"уже скачан: {rel['name']}"
+        try:
+            if file_sha256(dest) == rel["sha256"]:
+                return dest, f"уже скачан: {rel['name']}"
+        except OSError:
+            pass
+    log(f"скачиваю загрузчик {rel['name']}…")
+    if _download_to(rel["url"], dest, rel.get("sha256", ""), progress, log):
+        if _looks_like_uf2(dest):
+            return dest, f"скачан {rel['name']}"
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        return None, "скачанный файл не похож на UF2"
+    return None, "скачать загрузчик не удалось"
 
 
 # ------------------------------------------------------------- CLI по USB

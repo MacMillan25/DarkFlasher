@@ -1,4 +1,4 @@
-"""Dark Flasher 1.4.1 — интерфейс на PyQt6.
+"""Dark Flasher 1.5.0 — интерфейс на PyQt6.
 
 Логика записи UF2, поиска тома и COM взята из DarkFlasher.py и darktec_cfg.py;
 здесь только окно, стили и связи.
@@ -32,8 +32,9 @@ import darktec_cfg as cfg
 from DarkFlasher import (
     APP_NAME, APP_VERSION, FlashJob, FlashResult, Uf2Error, Uf2Info,
     UF2_FAMILY_NRF52840, VolumeWatcher, apply_factory_cfg_to_uf2,
-    build_dfu_zip_from_image, family_name, fmt_size, pack_factory_payload,
-    patch_factory_cfg, uf2_to_image,
+    build_dfu_zip_from_image, build_erase_uf2, erase_range, family_name,
+    fmt_size, pack_factory_payload, patch_factory_cfg, uf2_to_image,
+    uf2_upload_size,
 )
 
 # PIN режима разработчика. В коде лежит только PBKDF2-хеш: PBKDF2-HMAC-SHA256,
@@ -128,6 +129,16 @@ QPushButton#ota {
 QPushButton#ota:hover { background: #e6944a; }
 QPushButton#ota:pressed { background: #b86f2c; }
 QPushButton#ota:disabled { background: #6b4a26; color: #2a2018; }
+QPushButton#danger {
+    background: #2a1618;
+    border-color: #6e2f35;
+    color: #e2838c;
+    font-weight: 700;
+}
+QPushButton#danger:hover { background: #3a1d21; border-color: #9e4550; }
+QPushButton#danger:pressed { background: #211214; }
+QPushButton#danger:disabled { background: #1c1416; border-color: #3a2024;
+                              color: #6b4a4f; }
 QProgressBar {
     background: #161e2b;
     border: none;
@@ -471,6 +482,9 @@ class MainWindow(QMainWindow):
         self._manual_flash = False
         self._flashing = False
         self._flash_waiting = False
+        # Что пишем: прошивка, загрузчик OTAFIX или очистка памяти.
+        self._flash_purpose = "firmware"
+        self._pending_flash: tuple[str, int, str] | None = None
         self._deferred_refresh = False
         self._pending_releases: list[dict] | None = None
         self._dev_dirty = False
@@ -870,6 +884,28 @@ class MainWindow(QMainWindow):
         btns.addWidget(self.btn_send, 1)
         root.addLayout(btns)
 
+        # обслуживание: загрузчик OTAFIX и очистка памяти ноды
+        srv = QHBoxLayout()
+        srv.setSpacing(8)
+        self.btn_otafix = QPushButton("Прошить OTA FIX")
+        self.btn_otafix.setObjectName("ota")
+        self.btn_otafix.setMinimumHeight(38)
+        self.btn_otafix.setToolTip(
+            "Записать загрузчик OTAFIX — обновление по Bluetooth (Nordic DFU). "
+            "Плата должна быть в режиме загрузчика")
+        self.btn_otafix.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_otafix.clicked.connect(self.flash_otafix)
+        srv.addWidget(self.btn_otafix, 1)
+        self.btn_erase = QPushButton("Очистить память ноды")
+        self.btn_erase.setObjectName("danger")
+        self.btn_erase.setMinimumHeight(38)
+        self.btn_erase.setToolTip(
+            "Стереть настройки, ключи, контакты и каналы. Прошивка остаётся")
+        self.btn_erase.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_erase.clicked.connect(self.erase_node)
+        srv.addWidget(self.btn_erase, 1)
+        root.addLayout(srv)
+
         btns2 = QHBoxLayout()
         btns2.setSpacing(8)
         self.btn_uf2 = QPushButton("Собрать UF2 с настройками")
@@ -952,6 +988,8 @@ class MainWindow(QMainWindow):
                 # Оранжевым кнопкам — оранжевое свечение, остальным зелёное.
                 if isinstance(obj, QPushButton) and obj.objectName() == "ota":
                     glow = QColor(230, 148, 74, 200)
+                elif isinstance(obj, QPushButton) and obj.objectName() == "danger":
+                    glow = QColor(217, 106, 106, 200)
                 elif isinstance(obj, QPushButton) and obj.objectName() == "primary":
                     glow = QColor(78, 165, 131, 200)
                 else:
@@ -1689,26 +1727,125 @@ class MainWindow(QMainWindow):
             self.log_msg(f"это UF2 для {family_name(self.info.family)}, "
                          f"а нужен nRF52840", "err")
             return
+        self._flash_purpose = "firmware"
         self.log_msg(f"прошиваю: {cfg.role_title(self.role_slug)}", "ok")
-        if len(self.vols) == 1:
-            self._start_flash(self.vols[0])
-        else:
-            self._flash_waiting = True
-            self._set_busy(True)
-            self.set_status("жду плату в режиме загрузчика — быстро нажми RESET на плате ДВА раза")
-            self.log_msg("жду плату в режиме загрузчика… (быстро нажми RESET два раза)", "warn")
+        self._begin_flash_file(self.info.path, self.info.size, "прошивку")
 
-    def _start_flash(self, vol) -> None:
-        if self._flashing or not self.info:
+    def _begin_flash_file(self, path: str, total: int, title: str) -> None:
+        """Пишет любой файл: прошивку, загрузчик OTAFIX или очистку памяти."""
+        self._pending_flash = (path, total, title)
+        self._flash_waiting = True
+        if len(self.vols) == 1:
+            self._start_pending_flash(self.vols[0])
             return
+        self._set_busy(True)
+        self.set_status("жду плату в режиме загрузчика — быстро нажми RESET на плате ДВА раза")
+        self.log_msg("жду плату в режиме загрузчика… (быстро нажми RESET два раза)", "warn")
+
+    def _start_pending_flash(self, vol) -> None:
+        if self._flashing or self._pending_flash is None:
+            return
+        path, total, title = self._pending_flash
         self._flashing = True
         self._flash_waiting = False
         self._set_busy(True)
         self.watcher.pause()
         self.set_progress(0.15)
-        self.set_status(f"пишу {fmt_size(self.info.size)} — НЕ ОТКЛЮЧАЙ плату")
-        self.log_msg(f"пишу {fmt_size(self.info.size)} на {vol.title}", "info")
-        FlashJob(self.q, self.info, vol).start()
+        self.set_status(f"пишу {title} {fmt_size(total)} — НЕ ОТКЛЮЧАЙ плату")
+        self.log_msg(f"пишу {fmt_size(total)} на {vol.title}", "info")
+        FlashJob(self.q, path, total, vol).start()
+
+    # ---------------------------------------- ОБСЛУЖИВАНИЕ: OTAFIX И ОЧИСТКА
+    def flash_otafix(self) -> None:
+        """Записывает загрузчик OTAFIX — им работает обновление по Bluetooth."""
+        if self.busy:
+            self.log_msg("идёт операция — дождись окончания", "warn")
+            return
+        self._flash_purpose = "otafix"
+        self._manual_flash = False
+        self._pending_flash = None
+        self._set_busy(True)
+        self.set_progress(0.02)
+        self.set_status("готовлю загрузчик OTAFIX…")
+        if self.vols:
+            self.log_msg(f"загрузчик на плате: "
+                         f"{self.vols[0].bootloader or 'неизвестен'}", "dim")
+
+        def work() -> None:
+            def prog(done: int, total: int, speed: float) -> None:
+                frac = (done / total) if total else 0.5
+                self.q.put(("build_progress", 0.02 + 0.10 * frac))
+
+            try:
+                path, note = cfg.prepare_otafix(
+                    progress=prog,
+                    log=lambda m: self.q.put(("log", m, "dim")))
+            except Exception as e:  # noqa: BLE001
+                path, note = None, str(e)
+            self.q.put(("prepared", path, note, "загрузчик OTAFIX"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def erase_node(self) -> None:
+        """Стирает данные ноды: настройки, ключи, контакты и каналы."""
+        if self.busy:
+            self.log_msg("идёт операция — дождись окончания", "warn")
+            return
+        start, end = erase_range(self.role_slug)
+        answer = QMessageBox.question(
+            self, "Очистить память ноды",
+            "Стереть память ноды?\n\n"
+            "Удалятся настройки, ключи, контакты и каналы.\n"
+            "Прошивка и загрузчик останутся — нода запустится как новая.\n\n"
+            "Плату нужно перевести в режим загрузчика (Reset два раза).",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        out_dir = os.path.join(cfg.user_data_dir(), "erase")
+        out = os.path.join(out_dir, f"erase-{start:X}-{end:X}.uf2")
+        what = ("настройки, контакты и каналы"
+                if self.role_slug.startswith("companion_radio")
+                else "настройки и ключи")
+        self.log_msg(f"стираю {what}: 0x{start:X}..0x{end:X}", "warn")
+        self._flash_purpose = "erase"
+        self._manual_flash = False
+        self._pending_flash = None
+        self._set_busy(True)
+        self.set_progress(0.02)
+        self.set_status("готовлю очистку памяти…")
+
+        def work() -> None:
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+                stats = build_erase_uf2(out, start, end)
+                self.q.put(("log", f"образ очистки: {fmt_size(stats['bytes'])} · "
+                                   f"{stats['blocks']} блоков", "dim"))
+                self.q.put(("prepared", out, "", "очистку памяти"))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("prepared", None, str(e), "очистку памяти"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_otafix_written(self) -> None:
+        self._flash_purpose = "firmware"
+        self._set_busy(False)
+        self.set_progress(1.0)
+        self.set_status("загрузчик OTAFIX записан — плату можно отключать")
+        self.log_msg("ЗАГРУЗЧИК OTAFIX ЗАПИСАН — теперь нода умеет обновляться "
+                     "по воздуху (Nordic DFU)", "ok")
+        self.log_msg("дальше: «Очистить память ноды», если нужна чистая нода, "
+                     "и обычная прошивка выбранной версии", "dim")
+
+    def _on_erase_done(self) -> None:
+        self._flash_purpose = "firmware"
+        self._set_busy(False)
+        self.set_progress(1.0)
+        self.set_status("память очищена — нода запустится как новая")
+        self.log_msg("ПАМЯТЬ ОЧИЩЕНА — настройки, ключи и контакты стёрты, "
+                     "нода запустится как новая", "ok")
+        self.log_msg("прошивка осталась на месте; если нужна другая версия — "
+                     "нажми «Прошить»", "dim")
 
     # ------------------------------------------------------- СБОРКА ФАЙЛОВ
     def build_uf2(self) -> None:
@@ -1975,7 +2112,7 @@ class MainWindow(QMainWindow):
         widgets = [
             self.role_box, self.refresh_btn, self.send_cb,
             self.btn_flash, self.btn_send, self.btn_uf2, self.btn_ota,
-            self.module_box,
+            self.btn_otafix, self.btn_erase, self.module_box,
         ]
         widgets += list(self.fields.values())
         widgets += list(self.combos.values())
@@ -2024,7 +2161,11 @@ class MainWindow(QMainWindow):
                     self._update_badge()
                     if (len(self.vols) == 1 and self._flash_waiting
                             and not self._flashing):
-                        self._start_flash(self.vols[0])
+                        self._start_pending_flash(self.vols[0])
+                elif kind == "prepared":
+                    self._on_prepared(ev[1], ev[2], ev[3])
+                elif kind == "build_progress":
+                    self.set_progress(ev[1])
                 elif kind == "progress":
                     done, total = ev[1], ev[2]
                     if total:
@@ -2145,6 +2286,32 @@ class MainWindow(QMainWindow):
         except Exception as e:  # noqa: BLE001 — UI не должен умирать от одного события
             self.log_msg(f"внутренняя ошибка обработчика: {e}", "err")
 
+    def _on_prepared(self, path: str | None, note: str,
+                     title: str) -> None:
+        """Файл для записи готов (скачан загрузчик / собран образ очистки)."""
+        if not path:
+            self._flash_purpose = "firmware"
+            self.set_progress(0)
+            self.set_status(f"{title}: не готово — смотри лог")
+            self.log_msg(f"{title}: {note}", "err")
+            self._set_busy(False)
+            return
+        try:
+            total, blocks = uf2_upload_size(path)
+        except (OSError, Uf2Error) as e:
+            self._flash_purpose = "firmware"
+            self.set_progress(0)
+            self.set_status(f"{title}: файл не готов — смотри лог")
+            self.log_msg(f"{title}: {e}", "err")
+            self._set_busy(False)
+            return
+        if note:
+            self.log_msg(note, "ok")
+        self.log_msg(f"{title}: {os.path.basename(path)} · {fmt_size(total)} · "
+                     f"{blocks} блоков", "info")
+        self.set_progress(0.15)
+        self._begin_flash_file(path, total, title)
+
     def _set_badge(self, state: str, port: str = "",
                    port_count: int = 0) -> None:
         styles = {
@@ -2235,43 +2402,50 @@ class MainWindow(QMainWindow):
     def _on_flash(self, res: FlashResult) -> None:
         self._flashing = False
         self.watcher.resume()
-        manual = self._manual_flash
-        self._manual_flash = False
+        purpose = self._flash_purpose
         if res.no_volume:
-            self._manual_flash = manual
+            # Диск исчез между проверкой и записью: остаёмся ждать плату.
             self._flash_waiting = True
             self._set_busy(True)
             self.log_msg("не успел поймать диск — жду ещё раз, нажми Reset", "warn")
             self.set_status("жду плату в режиме загрузчика — быстро нажми RESET на плате ДВА раза")
             return
-        if res.ok:
-            self.set_progress(0.70)
-            if res.rebooted:
-                self.set_status(f"записано за {res.elapsed:.1f} с")
-                self.log_msg(f"готово за {res.elapsed:.1f} с — плата "
-                             f"перезагрузилась", "ok")
-            else:
-                self.set_status("записано, но плата не перезагрузилась — нажми Reset")
-                self.log_msg("файл записан, но том не исчез", "warn")
-            if not manual:
-                self._start_settings_send()
-            else:
-                self._set_busy(False)
-                self.set_progress(1.0)
-                self.set_status("готово — плату можно отключать "
-                                "(настройки не отправлялись)")
-                self.log_msg("настройки не отправлялись: файл выбран вручную",
-                             "warn")
-                self.log_msg(
-                    "ПРОШИВКА ЗАВЕРШЕНА — плату можно отключать и пользоваться",
-                    "ok")
-        else:
+        self._pending_flash = None
+        if not res.ok:
             self._flash_waiting = False
+            self._flash_purpose = "firmware"
             self._set_busy(False)
             self.set_progress(0)
             msg = res.message
             self.set_status(f"{msg} · записано {res.percent}%")
             self.log_msg(f"ошибка: {msg}", "err")
+            return
+        self.set_progress(0.70)
+        if res.rebooted:
+            self.set_status(f"записано за {res.elapsed:.1f} с")
+            self.log_msg(f"готово за {res.elapsed:.1f} с — плата "
+                         f"перезагрузилась", "ok")
+        else:
+            self.set_status("записано, но плата не перезагрузилась — нажми Reset")
+            self.log_msg("файл записан, но том не исчез", "warn")
+        if purpose == "otafix":
+            self._on_otafix_written()
+            return
+        if purpose == "erase":
+            self._on_erase_done()
+            return
+        manual = self._manual_flash
+        self._manual_flash = False
+        if not manual:
+            self._start_settings_send()
+            return
+        self._set_busy(False)
+        self.set_progress(1.0)
+        self.set_status("готово — плату можно отключать "
+                        "(настройки не отправлялись)")
+        self.log_msg("настройки не отправлялись: файл выбран вручную", "warn")
+        self.log_msg(
+            "ПРОШИВКА ЗАВЕРШЕНА — плату можно отключать и пользоваться", "ok")
 
     # ---------------------------------------------------------------- drag&drop
     def dragEnterEvent(self, e) -> None:

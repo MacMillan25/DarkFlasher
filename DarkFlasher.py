@@ -42,7 +42,7 @@ from dataclasses import dataclass
 
 
 APP_NAME = "Dark Flasher"
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.5.0"
 
 DEST_NAME = "FW.UF2"          # короткое 8.3-имя: никаких сюрпризов с LFN
 CHUNK_SIZE = 16 * 1024
@@ -56,10 +56,91 @@ UF2_MAGIC_END_STD = 0x0FE2E000
 UF2_MAGIC_END_NICE = 0x0AB16F30
 UF2_MAGIC_ENDS = (UF2_MAGIC_END_STD, UF2_MAGIC_END_NICE)
 UF2_FAMILY_NRF52840 = 0xADA52840
+UF2_FLAG_FAMILYID = 0x00002000
 UF2_BLOCK = 512
 UF2_PAYLOAD = 256
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 APP_FLASH_BASE = 0x26000
+
+# --- разделы данных в флеше ноды -------------------------------------------
+# Настройки ноды живут в двух маленьких файловых системах в верхней части
+# флеша (Adafruit InternalFS и CustomLFS из MeshCore):
+#   ExtraFS    0xD4000..0xED000 — контакты и каналы companion-ноды;
+#   InternalFS 0xED000..0xF4000 — ключи, настройки, бондинги (у всех ролей).
+# Прошивка лежит ниже 0xD4000, загрузчик начинается с 0xF4000 — их не трогаем.
+FS_EXTRA_BASE = 0xD4000
+FS_INTERNAL_BASE = 0xED000
+FS_DATA_END = 0xF4000
+
+
+def erase_range(role: str) -> tuple[int, int]:
+    """Что стирать кнопкой «Очистить память» для этой роли.
+
+    Companion держит контакты и каналы в ExtraFS, остальные роли — только в
+    InternalFS. Прошивка ниже 0xD4000, загрузчик выше 0xF4000.
+    """
+    if (role or "").startswith("companion_radio"):
+        return FS_EXTRA_BASE, FS_DATA_END
+    return FS_INTERNAL_BASE, FS_DATA_END
+
+
+def build_erase_uf2(dst_path: str, start: int, end: int) -> dict:
+    """Собирает UF2, который вычищает раздел данных: все байты 0xFF.
+
+    Загрузчик перед записью страницы её стирает, поэтому образ из одних 0xFF
+    действительно очищает флеш. Блоки вне области приложения загрузчик
+    отвергает, так что прошивку и сам загрузчик такой файл не тронет.
+    """
+    if start % UF2_PAYLOAD or end % UF2_PAYLOAD:
+        raise Uf2Error("границы очистки не кратны 256 байтам")
+    if not (FS_EXTRA_BASE <= start < end <= FS_DATA_END):
+        raise Uf2Error(f"область очистки 0x{start:X}..0x{end:X} выходит за "
+                       f"разделы данных — отказался")
+    blocks = (end - start) // UF2_PAYLOAD
+    blank = b"\xff" * UF2_PAYLOAD
+    data = bytearray(blocks * UF2_BLOCK)
+    for idx in range(blocks):
+        off = idx * UF2_BLOCK
+        struct.pack_into("<8I", data, off, UF2_MAGIC0, UF2_MAGIC1,
+                         UF2_FLAG_FAMILYID, start + idx * UF2_PAYLOAD,
+                         UF2_PAYLOAD, idx, blocks, UF2_FAMILY_NRF52840)
+        data[off + 32:off + 32 + UF2_PAYLOAD] = blank
+        struct.pack_into("<I", data, off + UF2_BLOCK - 4, UF2_MAGIC_END_STD)
+
+    tmp = dst_path + ".part"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, dst_path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    return {"blocks": blocks, "size": os.path.getsize(dst_path),
+            "start": start, "end": end, "bytes": end - start}
+
+
+def uf2_upload_size(path: str) -> tuple[int, int]:
+    """Размер файла для записи «как есть»: (байт, блоков).
+
+    Для файлов, которые нельзя проверить как непрерывный образ: update-*.uf2
+    загрузчика OTAFIX состоит из блоков в разных адресах (образ загрузчика и
+    строка UICR), и Uf2Info на нём справедливо ругается. Содержимое проверит
+    сам загрузчик на плате.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError as e:
+        raise Uf2Error(f"не могу открыть файл: {e.strerror or e}") from e
+    if size < UF2_BLOCK or size % UF2_BLOCK:
+        raise Uf2Error("размер не кратен 512 байт — это не UF2")
+    with open(path, "rb") as f:
+        if f.read(4) != b"UF2\n":
+            raise Uf2Error("файл не начинается с сигнатуры UF2")
+    return size, size // UF2_BLOCK
+
 
 # OTA: сборка Nordic DFU пакета (zip) из готового .uf2
 # --------------------------------------------------------------------------
@@ -820,10 +901,18 @@ class VolumeWatcher(threading.Thread):
 
 
 class FlashJob(threading.Thread):
-    def __init__(self, q: queue.Queue, info: Uf2Info, volume: Uf2Volume):
+    """Пишет файл на том. total — размер файла, который ждём записать.
+
+    info от Uf2Info не нужен: файл загрузчика OTAFIX не непрерывный образ,
+    но пишется так же — байт в байт.
+    """
+
+    def __init__(self, q: queue.Queue, path: str, total: int,
+                 volume: Uf2Volume):
         super().__init__(name="flash-job", daemon=True)
         self.q = q
-        self.info = info
+        self.path = path
+        self.total = total
         self.volume = volume
 
     def _resolve_volume(self) -> Uf2Volume | None:
@@ -845,18 +934,18 @@ class FlashJob(threading.Thread):
             vol = self._resolve_volume()
             if vol is None:
                 self.q.put(("flash", FlashResult(
-                    False, 0, self.info.size, 0,
+                    False, 0, self.total, 0,
                     "плата не в режиме загрузчика", time.monotonic() - started,
                     no_volume=True)))
                 return
             if vol.path != self.volume.path:
                 self.q.put(("log", f"том переподключился: {vol.where}", "warn"))
             res = write_uf2(
-                vol.path, self.info.path, self.info.size,
+                vol.path, self.path, self.total,
                 progress=lambda done, total: self.q.put(("progress", done, total)),
             )
             res.elapsed = time.monotonic() - started
-            size = self.info.size
+            size = self.total
 
             if res.written == size and res.ok:
                 res.ok = True
@@ -881,7 +970,7 @@ class FlashJob(threading.Thread):
             self.q.put(("flash", res))
         except Exception as e:  # noqa: BLE001 — поток не должен падать молча
             self.q.put(("flash", FlashResult(
-                False, 0, self.info.size, 0, f"внутренняя ошибка: {e}",
+                False, 0, self.total, 0, f"внутренняя ошибка: {e}",
                 time.monotonic() - started)))
 
 
