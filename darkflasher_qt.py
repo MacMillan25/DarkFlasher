@@ -43,6 +43,11 @@ DEV_PIN_SALT = b"DarkFlasher::dev::pin::v1"
 DEV_PIN_ITERATIONS = 120_000
 DEV_PIN_HASH = "2e0066cb6715194d0feb9a2c1f5400c9d99e7727399bd0c903d02d3880053705"
 
+# Запас по высоте окна: столько пикселей добавляем к высоте содержимого, чтобы
+# при обычном размере не появлялся столбик прокрутки (лэйаут и шрифты дают
+# размер чуть позже, чем считает sizeHint).
+FIT_RESERVE = 10
+
 
 def dev_pin_ok(pin: str) -> bool:
     got = hashlib.pbkdf2_hmac("sha256", (pin or "").encode("utf-8"),
@@ -501,6 +506,7 @@ class MainWindow(QMainWindow):
         self._dev_dirty = False
         self._save_error = False
         self._closing = False
+        self._fitted = False
         self._badge_cache = None
 
         self.save_timer = QTimer(self)
@@ -971,11 +977,35 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(scroll)
 
     def _fit_to_content(self) -> None:
-        """Окно по высоте содержимого: при обычном размере скроллбара нет."""
+        """Окно по высоте содержимого: при обычном размере скроллбара нет.
+
+        sizeHint до показа окна отстаёт от настоящего лэйаута (шрифты, DPI,
+        список версий подгружается позже), поэтому есть небольшой запас и
+        добирание высоты по факту появления скроллбара.
+        """
         scroll = self.centralWidget()
         content = scroll.widget() if isinstance(scroll, QScrollArea) else scroll
         height = content.sizeHint().height() if content is not None else 840
-        self.resize(700, max(600, height + 2))
+        self.resize(700, max(600, height + FIT_RESERVE))
+        if isinstance(scroll, QScrollArea):
+            QTimer.singleShot(0, self._grow_if_scrollbar)
+
+    def _grow_if_scrollbar(self) -> None:
+        """Если содержимое всё-таки не влезло, добираем высоту по факту."""
+        scroll = self.centralWidget()
+        if not isinstance(scroll, QScrollArea):
+            return
+        gap = scroll.verticalScrollBar().maximum()
+        if gap > 0:
+            self.resize(self.width(), self.height() + gap + 1)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._fitted:
+            return
+        self._fitted = True
+        # окончательная примерка — только когда окно уже показано
+        QTimer.singleShot(0, self._fit_to_content)
 
     def _install_glow(self) -> None:
         """Неоновое свечение вокруг полей и кнопок при наведении."""
@@ -1444,6 +1474,8 @@ class MainWindow(QMainWindow):
         elif not silent:
             self.log_msg("список версий актуален", "dim")
 
+        # список версий мог изменить высоту полей — примеряемся ещё раз
+        QTimer.singleShot(0, self._grow_if_scrollbar)
         self._arm_release_timer()
 
     def _rebuild_version_list(self) -> None:
