@@ -30,10 +30,11 @@ from PyQt6.QtWidgets import (
 
 import darktec_cfg as cfg
 from DarkFlasher import (
-    APP_NAME, APP_VERSION, FlashJob, FlashResult, Uf2Error, Uf2Info,
-    UF2_FAMILY_NRF52840, VolumeWatcher, apply_factory_cfg_to_uf2, blank_range,
-    build_dfu_zip_from_image, build_erase_uf2, family_name, fmt_size,
-    pack_factory_payload, patch_factory_cfg, uf2_to_image, uf2_upload_size,
+    APP_NAME, APP_VERSION, ERASE_IMAGE, ERASE_IMAGE_SHA256, FlashJob,
+    FlashResult, Uf2Error, Uf2Info, UF2_FAMILY_NRF52840, VolumeWatcher,
+    apply_factory_cfg_to_uf2, build_dfu_zip_from_image, family_name, fmt_size,
+    pack_factory_payload, patch_factory_cfg, resource_path, uf2_to_image,
+    uf2_upload_size,
 )
 
 # PIN режима разработчика. В коде лежит только PBKDF2-хеш: PBKDF2-HMAC-SHA256,
@@ -490,9 +491,11 @@ class MainWindow(QMainWindow):
         self._manual_flash = False
         self._flashing = False
         self._flash_waiting = False
-        # Что пишем: прошивка, загрузчик OTAFIX или очистка памяти.
+        # Что пишем: прошивка, загрузчик OTAFIX или образ очистки.
         self._flash_purpose = "firmware"
         self._pending_flash: tuple[str, int, str] | None = None
+        # Ждём, пока стирающий образ отработает и вернёт диск загрузчика.
+        self._await_erase_reboot = False
         self._deferred_refresh = False
         self._pending_releases: list[dict] | None = None
         self._dev_dirty = False
@@ -1798,79 +1801,64 @@ class MainWindow(QMainWindow):
         threading.Thread(target=work, daemon=True).start()
 
     def erase_node(self) -> None:
-        """Стирает всё: данные по USB, потом прошивку через UF2."""
+        """Стирает всё: прошивку, настройки, ключи, контакты и каналы."""
         if self.busy:
             self.log_msg("идёт операция — дождись окончания", "warn")
             return
         answer = QMessageBox.question(
             self, "Полная очистка ноды",
             "Стереть всё с ноды?\n\n"
-            "Сначала прошивка сама стирает данные по USB (настройки, ключи, "
-            "контакты, каналы, привязки Bluetooth).\n"
-            "Потом стирается сама прошивка: плату нужно перевести в загрузчик "
-            "(Reset два раза).\n\n"
-            "В ноде останется только загрузчик — прошивку надо будет записать "
-            "заново.",
+            "Удалятся прошивка, настройки, ключи, контакты, каналы и "
+            "привязки Bluetooth. В ноде останется только загрузчик — "
+            "прошивку надо будет записать заново.\n\n"
+            "Плату нужно перевести в режим загрузчика (Reset два раза).",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         if answer != QMessageBox.StandardButton.Yes:
             return
+        # Вшитый образ стирания рассчитан на SoftDevice v6 (S140 6.1.1).
+        for vol in self.vols:
+            boot = (vol.bootloader or "").lower()
+            if "7.3" in boot or "s140 7" in boot:
+                self.set_status("у платы SoftDevice v7 — нужен образ очистки v7")
+                self.log_msg("на плате SoftDevice v7, а вшитый образ очистки "
+                             "рассчитан на v6 (S140 6.1.1) — очистка отменена. "
+                             "Возьми FLASH_ERASE_nrf52_softdevice_v7 из "
+                             "флешера MeshCore", "err")
+                return
+        path = resource_path(ERASE_IMAGE)
+        if not path:
+            self.log_msg("в сборке нет образа очистки (assets) — пересобери "
+                         "exe", "err")
+            self.set_status("нет образа очистки — смотри лог")
+            return
+        try:
+            digest = cfg.file_sha256(path)
+        except OSError as e:
+            digest = ""
+            self.log_msg(f"образ очистки не читается: {e}", "err")
+        if digest != ERASE_IMAGE_SHA256:
+            self.set_status("образ очистки повреждён — очистка отменена")
+            self.log_msg("образ очистки повреждён (sha256 не совпал) — "
+                         "очистка отменена", "err")
+            return
+        try:
+            total, blocks = uf2_upload_size(path)
+        except (OSError, Uf2Error) as e:
+            self.set_status("образ очистки не готов — смотри лог")
+            self.log_msg(f"образ очистки: {e}", "err")
+            return
         self._flash_purpose = "erase"
         self._manual_flash = False
         self._pending_flash = None
+        self._await_erase_reboot = False
         self._set_busy(True)
-        self.set_progress(0.02)
-        self.set_status("стираю данные ноды по USB…")
-        self.log_msg("полная очистка: сначала данные по USB, потом прошивка",
-                     "warn")
-        role = self.role_slug
-        preferred = self.port
-
-        def work() -> None:
-            try:
-                ok, note = cfg.wipe_data(role, preferred=preferred)
-            except Exception as e:  # noqa: BLE001
-                ok, note = False, str(e)
-            self.q.put(("wipe_data", ok, note))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _on_wipe_data(self, ok: bool, note: str) -> None:
-        """Данные стёрты (или нет) — решаем, стирать ли прошивку."""
-        if ok:
-            self.log_msg(f"данные стёрты — {note}", "ok")
-            self.set_status("данные стёрты — теперь переведи плату в загрузчик")
-            self._start_blank_erase()
-            return
-        self._flash_purpose = "firmware"
-        self.set_progress(0)
-        self.set_status("очистка отменена — смотри лог")
-        self.log_msg(f"данные стереть не удалось: {note}", "err")
-        self.log_msg(
-            "полная очистка начинается с данных: их стирает сама прошивка по "
-            "USB. Прошей любую версию, дай ноде загрузиться и нажми «Полная "
-            "очистка ноды» ещё раз", "warn")
-        self._set_busy(False)
-
-    def _start_blank_erase(self) -> None:
-        """Собирает образ полной очистки и уходит в запись (ждёт загрузчик)."""
-        start, end = blank_range()
-        out_dir = os.path.join(cfg.user_data_dir(), "erase")
-        out = os.path.join(out_dir, f"blank-{start:X}-{end:X}.uf2")
-        self.log_msg(f"образ очистки: 0x{start:X}..0x{end:X} — прошивка и "
-                     f"все данные", "dim")
-
-        def work() -> None:
-            try:
-                os.makedirs(out_dir, exist_ok=True)
-                stats = build_erase_uf2(out, start, end)
-                self.q.put(("log", f"образ очистки: {fmt_size(stats['bytes'])} "
-                                   f"данных · {stats['blocks']} блоков", "dim"))
-                self.q.put(("prepared", out, "", "образ очистки"))
-            except Exception as e:  # noqa: BLE001
-                self.q.put(("prepared", None, str(e), "образ очистки"))
-
-        threading.Thread(target=work, daemon=True).start()
+        self.set_progress(0.05)
+        self.log_msg(f"полная очистка: образ {os.path.basename(path)} · "
+                     f"{fmt_size(total)} · {blocks} блоков", "warn")
+        self.log_msg("сотрётся всё: прошивка, настройки, ключи, контакты, "
+                     "каналы", "dim")
+        self._begin_flash_file(path, total, "образ очистки")
 
     def _on_otafix_written(self) -> None:
         self._flash_purpose = "firmware"
@@ -1886,11 +1874,16 @@ class MainWindow(QMainWindow):
         self._flash_purpose = "firmware"
         self._set_busy(False)
         self.set_progress(1.0)
-        self.set_status("нода стёрта — остался только загрузчик")
-        self.log_msg("ПОЛНАЯ ОЧИСТКА: прошивки и данных нет, в ноде остался "
-                     "только загрузчик", "ok")
-        self.log_msg("плата в загрузчике — жми «Прошить», чтобы записать "
-                     "прошивку выбранной версии", "dim")
+        self.log_msg("ПОЛНАЯ ОЧИСТКА: прошивка и все данные стёрты, в ноде "
+                     "остался только загрузчик", "ok")
+        self.log_msg("дальше: «Прошить» — запишет прошивку выбранной версии",
+                     "dim")
+        if self.vols:
+            self.set_status("нода стёрта — плата в загрузчике, жми «Прошить»")
+            return
+        # стирающий образ сейчас работает и перезагрузит плату в загрузчик
+        self._await_erase_reboot = True
+        self.set_status("нода стирается… ждём диск загрузчика")
 
     # ------------------------------------------------------- СБОРКА ФАЙЛОВ
     def build_uf2(self) -> None:
@@ -2204,13 +2197,17 @@ class MainWindow(QMainWindow):
                 if kind == "volumes":
                     self.vols = ev[1]
                     self._update_badge()
+                    if self._await_erase_reboot and self.vols:
+                        self._await_erase_reboot = False
+                        self.set_status("нода стёрта — плата в загрузчике, "
+                                        "жми «Прошить»")
+                        self.log_msg("нода снова в загрузчике — можно "
+                                     "прошивать", "ok")
                     if (len(self.vols) == 1 and self._flash_waiting
                             and not self._flashing):
                         self._start_pending_flash(self.vols[0])
                 elif kind == "prepared":
                     self._on_prepared(ev[1], ev[2], ev[3])
-                elif kind == "wipe_data":
-                    self._on_wipe_data(bool(ev[1]), ev[2])
                 elif kind == "build_progress":
                     self.set_progress(ev[1])
                 elif kind == "progress":

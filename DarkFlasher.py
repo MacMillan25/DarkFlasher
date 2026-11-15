@@ -56,70 +56,42 @@ UF2_MAGIC_END_STD = 0x0FE2E000
 UF2_MAGIC_END_NICE = 0x0AB16F30
 UF2_MAGIC_ENDS = (UF2_MAGIC_END_STD, UF2_MAGIC_END_NICE)
 UF2_FAMILY_NRF52840 = 0xADA52840
-UF2_FLAG_FAMILYID = 0x00002000
 UF2_BLOCK = 512
 UF2_PAYLOAD = 256
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 APP_FLASH_BASE = 0x26000
 
-# --- разделы в флеше ноды --------------------------------------------------
-# Область приложения: 0x26000..0xF4000 — прошивка и данные. Внутри неё
-# Adafruit InternalFS и CustomLFS из MeshCore держат настройки:
-#   ExtraFS    0xD4000..0xED000 — контакты и каналы companion-ноды;
-#   InternalFS 0xED000..0xF4000 — ключи, настройки, бондинги (у всех ролей).
-# Загрузчик начинается с 0xF4000: без него плату не поднять без программатора,
-# поэтому его не трогаем.
-FS_EXTRA_BASE = 0xD4000
-FS_INTERNAL_BASE = 0xED000
-FS_DATA_END = 0xF4000
-
-# Загрузчик может защищать хвост области приложения (DFU_APP_DATA_RESERVED,
-# у Adafruit для nRF52840 это 40 КБ): блоки оттуда по UF2 не пишутся. Поэтому
-# образ очистки закрывает всю область приложения, а данные дополнительно
-# стираются прошивкой по USB (см. darktec_cfg.wipe_data).
-
-
-def blank_range() -> tuple[int, int]:
-    """Что стирает образ полной очистки: вся область приложения целиком."""
-    return APP_FLASH_BASE, FS_DATA_END
+# --- полная очистка ноды ----------------------------------------------------
+# Готовый «стирающий» образ из официального флешера MeshCore
+# (flasher.meshcore.io). Это обычное приложение nRF52 для SoftDevice v6
+# (S140 6.1.1, как в DarkTec): оно запускается по UF2 и стирает флеш от
+# 0x26000 до загрузчика — прошивку, настройки, ключи, контакты и каналы, —
+# а потом оставляет плату в режиме UF2. Загрузчик и SoftDevice остаются,
+# иначе плату не поднять без программатора.
+#
+# По UF2 стереть эти разделы нельзя: хвост области приложения
+# (0xEA000..0xF4000, DFU_APP_DATA_RESERVED) загрузчик не пишет, а именно там
+# лежат ключи и настройки. Поэтому стирает не «пустой» UF2, а эта прошивка.
+ERASE_IMAGE = "assets/FLASH_ERASE_nrf52_softdevice_v6.uf2"
+ERASE_IMAGE_SHA256 = ("c1f6c5cfd0e1fcd364d96408db4aad2719ae03790912f768"
+                      "6ea60d0b9b623def")
 
 
-def build_erase_uf2(dst_path: str, start: int, end: int) -> dict:
-    """Собирает UF2, который вычищает область: все байты 0xFF.
-
-    Загрузчик перед записью страницы её стирает, поэтому образ из одних 0xFF
-    действительно очищает флеш. Блоки, которые загрузчик считает защищёнными
-    (хвост области приложения), он пропустит — их стирает прошивка по USB.
-    """
-    if start % UF2_PAYLOAD or end % UF2_PAYLOAD:
-        raise Uf2Error("границы очистки не кратны 256 байтам")
-    if not (APP_FLASH_BASE <= start < end <= FS_DATA_END):
-        raise Uf2Error(f"область очистки 0x{start:X}..0x{end:X} выходит за "
-                       f"область приложения — отказался")
-    blocks = (end - start) // UF2_PAYLOAD
-    blank = b"\xff" * UF2_PAYLOAD
-    data = bytearray(blocks * UF2_BLOCK)
-    for idx in range(blocks):
-        off = idx * UF2_BLOCK
-        struct.pack_into("<8I", data, off, UF2_MAGIC0, UF2_MAGIC1,
-                         UF2_FLAG_FAMILYID, start + idx * UF2_PAYLOAD,
-                         UF2_PAYLOAD, idx, blocks, UF2_FAMILY_NRF52840)
-        data[off + 32:off + 32 + UF2_PAYLOAD] = blank
-        struct.pack_into("<I", data, off + UF2_BLOCK - 4, UF2_MAGIC_END_STD)
-
-    tmp = dst_path + ".part"
-    try:
-        with open(tmp, "wb") as f:
-            f.write(data)
-        os.replace(tmp, dst_path)
-    finally:
-        if os.path.exists(tmp):
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-    return {"blocks": blocks, "size": os.path.getsize(dst_path),
-            "start": start, "end": end, "bytes": end - start}
+def resource_path(name: str) -> str | None:
+    """Путь к файлу, вложенному в exe (--add-data) или лежащему рядом."""
+    roots = []
+    meipass = getattr(sys, "_MEIPASS", "")
+    if meipass:
+        roots.append(meipass)
+    roots.append(app_dir())
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in roots:
+        roots.append(here)
+    for root in roots:
+        path = os.path.join(root, name)
+        if os.path.isfile(path):
+            return path
+    return None
 
 
 def uf2_upload_size(path: str) -> tuple[int, int]:

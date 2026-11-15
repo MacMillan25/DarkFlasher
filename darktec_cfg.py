@@ -20,8 +20,6 @@ SERIAL_BAUD = 115200
 # Бинарный протокол компаньона (MyMesh.cpp): кадр `<` + len16 + payload.
 CMD_RUN_CLI = 66       # CMD_RUN_CLI_COMMAND, v14+
 RESP_CLI_REPLY = 29    # RESP_CODE_CLI_REPLY
-CMD_FACTORY_RESET = 51  # CMD_FACTORY_RESET + "reset": стирает ФС и ребутит
-RESP_CODE_OK = 0       # RESP_CODE_OK
 
 # VID, по которым узнаём nRF52: Adafruit (bootloader и core) и Nordic.
 NRF_VIDS = {0x239A, 0x1915}
@@ -792,82 +790,6 @@ def _read_cli_reply(ser, timeout: float = 3.5) -> str:
     if payload is None:
         return ""
     return payload[1:].decode("utf-8", "replace").strip()
-
-
-def companion_factory_reset(port: str,
-                            timeout: float = 4.0) -> tuple[bool, str]:
-    """Заводской сброс компаньона: стирает обе ФС и перезагружает ноду.
-
-    Кадровая команда CMD_FACTORY_RESET ("reset") форматирует UserData и
-    ExtraFS (настройки, ключи, контакты, каналы, привязки Bluetooth) и сразу
-    уходит в ребут, поэтому ответный кадр может не дойти — тогда признаком
-    успеха считаем исчезновение порта.
-    """
-    try:
-        ser = open_serial(port)
-    except Exception as e:  # noqa: BLE001
-        return False, f"COM {port}: {e}"
-    reply: bytes | None = None
-    try:
-        time.sleep(0.2)
-        ser.reset_input_buffer()
-        payload = bytes([CMD_FACTORY_RESET]) + b"reset"
-        ser.write(b"<" + bytes([len(payload) & 0xFF,
-                                (len(payload) >> 8) & 0xFF]) + payload)
-        ser.flush()
-        reply = _read_frame(ser, timeout)
-    except Exception:  # noqa: BLE001
-        reply = None
-    finally:
-        try:
-            ser.close()
-        except Exception:
-            pass
-    if reply is not None:
-        ok = reply[:1] == bytes([RESP_CODE_OK])
-        return ok, ("заводской сброс принят"
-                    if ok else "нода ответила ошибкой")
-    # ответа нет: после сброса нода уходит в ребут — порт должен исчезнуть.
-    # Перезагрузка быстрая, поэтому проверяем часто, а ждём долго.
-    deadline = time.time() + 8.0
-    while time.time() < deadline:
-        if port not in nrf_ports():
-            return True, "нода перезагрузилась (ответ не дошёл)"
-        time.sleep(0.1)
-    return False, "нет ответа на команду сброса"
-
-
-def wipe_data(role: str, preferred: str | None = None,
-              timeout: float = 6.0) -> tuple[bool, str]:
-    """Стирает данные ноды по USB: настройки, ключи, контакты и каналы.
-
-    Companion стирает обе файловые системы заводским сбросом, остальные роли —
-    CLI-командой `erase` (CommonCLI). Роль из окна может не совпадать с тем,
-    что залито в ноду, поэтому пробуем оба протокола: сначала «свой», потом
-    второй. Возвращает (получилось, пояснение).
-    """
-    frames_first = (role or "").startswith("companion_radio")
-    order = [("frames", True), ("text", False)]
-    if not frames_first:
-        order.reverse()
-    notes: list[str] = []
-    for proto, as_companion in order:
-        port = find_meshcore_port(proto, timeout, preferred=preferred)
-        if not port:
-            notes.append(f"{proto}: нода не ответила")
-            continue
-        if as_companion:
-            ok, note = companion_factory_reset(port)
-            note = f"{port}: {note}"
-        else:
-            reply = _text_cmd(port, "erase", 6.0)
-            low = (reply or "").lower()
-            ok = "ok" in low and "err" not in low
-            note = f"{port}: {reply or 'нет ответа'}"
-        if ok:
-            return True, note
-        notes.append(note)
-    return False, "; ".join(notes)
 
 
 def send_commands_batch(port: str, commands: list[str], protocol: str = "frames",

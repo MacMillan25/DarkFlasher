@@ -4,6 +4,7 @@ if not exist build mkdir build
 python -m PyInstaller --noconfirm --clean --onefile --windowed --name DarkFlasher ^
   --specpath build ^
   --icon "%CD%\app.ico" --add-data "%CD%\app.ico;." ^
+  --add-data "%CD%\assets\FLASH_ERASE_nrf52_softdevice_v6.uf2;assets" ^
   --version-file "%CD%\version_info.txt" ^
   --hidden-import serial --hidden-import serial.tools.list_ports ^
   darkflasher_qt.py

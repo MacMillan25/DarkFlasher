@@ -10,3 +10,5 @@ MyFlasher/
 *.zip
 *.bak
 darkflasher.json
+# образ полной очистки вшивается в exe — он должен лежать в репозитории
+!assets/FLASH_ERASE_nrf52_softdevice_v6.uf2
