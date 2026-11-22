@@ -41,6 +41,10 @@ ROLE_TITLES = {slug: title for slug, title, _env in ROLES}
 ROLE_ENVS = {slug: env for slug, _title, env in ROLES}
 ENV_TO_ROLE = {env: slug for slug, _title, env in ROLES}
 
+# Роли, у которых в прошивке нет блока заводских настроек: вшивать некуда.
+# Список должен совпадать с NO_BLOCK в tools/check_factory_cfg.py прошивки.
+NO_FACTORY_ROLES = {"kiss_modem", "terminal_chat"}
+
 # Порядок обязан совпадать с DarktecPrefsFormat::ModuleCode в прошивке.
 MODULES = [
     (0, "E22-900M33S"),
@@ -59,6 +63,9 @@ DEFAULT_SETTINGS = {
     "tx": 22,
     "capacity": 3000,
     "module": 0,
+    # V-cut: порог отключения по низкому напряжению, в 100 мВ.
+    # 0 — штатные 3.40 В (прошивка сама их и ставит).
+    "lowbat": 0,
     "adc": 1.750,
     # Что именно передавать на ноду: галочки в окне.
     "use_name": True,
@@ -66,6 +73,7 @@ DEFAULT_SETTINGS = {
     "use_tx": True,          # мощность
     "use_module": True,      # радиомодуль
     "use_capacity": True,
+    "use_lowbat": True,      # V-cut
     "use_adc": True,
     "send_after_flash": True,
     # Последний увиденный релиз — чтобы подсветить «что нового» один раз.
@@ -308,7 +316,7 @@ def open_serial(port: str, dtr: bool = True):
 
 # ------------------------------------------------------------- сборка команд
 
-def build_commands(s: dict) -> list[str]:
+def build_commands(s: dict, lowbat_ok: bool = True) -> list[str]:
     cmds: list[str] = []
     if s.get("use_name", True):
         name = (str(s.get("name", "")).replace("\r", " ")
@@ -328,6 +336,13 @@ def build_commands(s: dict) -> list[str]:
         cmds.append(f"set adc.multiplier {float(s.get('adc', 1.75)):.3f}")
     if s.get("use_capacity", True):
         cmds.append(f"set darktec.capacity {int(s.get('capacity', 3000))}")
+    if s.get("use_lowbat", True) and lowbat_ok:
+        # «Штатный» (0) не трогаем: у ноды порог уже такой, а команда на
+        # старых прошивках неизвестна. Иначе порог в вольтах — как в меню
+        # `[ Darktec ]` (шаг 0.1 В).
+        lowbat = int(s.get("lowbat") or 0)
+        if lowbat > 0:
+            cmds.append(f"set darktec.lowbat {lowbat / 10:.2f}")
     return cmds
 
 
@@ -342,6 +357,12 @@ RELEASES_API = ("https://api.github.com/repos/MacMillan25/MeshCore/"
 MIN_FIRMWARE_BUILD = 7
 MAX_FIRMWARE_RELEASES = 5
 
+# С какой сборки реально работает `set darktec.lowbat`. Команда была объявлена
+# ещё в d6, но из-за ошибки в разборе префикса отвечала «Unknown command» —
+# заработала в d12. Раньше этого номера V-cut на ноду не шлём, чтобы не
+# срывать всю пачку настроек.
+LOWBAT_MIN_BUILD = 12
+
 # Папка моих локальных сборок PlatformIO. Есть только на моей машине;
 # путь можно переопределить ключом dev_firmware_dir в darkflasher.json.
 DEV_FIRMWARE_DIR = r"C:\Dev\MeshCore-git\out\uf2"
@@ -349,11 +370,22 @@ DEV_FIRMWARE_DIR = r"C:\Dev\MeshCore-git\out\uf2"
 # Номер сборки: «0d10» в darktec-v1.18.0d10 или в имени файла.
 _BUILD_RE = re.compile(r"(?<=\d)[dD](\d+)")
 
+# Номер сборки именно из строки версии ноды: «v1.18.0d12-01f78d12».
+# Общий _BUILD_RE здесь не годится: хеш коммита тоже может содержать «d12»,
+# и последнее совпадение окажется не тем.
+_VER_BUILD_RE = re.compile(r"v\d+\.\d+\.\d+[dD](\d+)")
+
 
 def firmware_build_number(text: str) -> int | None:
     """Номер dN из тега или имени файла; None, если номера нет."""
     found = _BUILD_RE.findall(text or "")
     return int(found[-1]) if found else None
+
+
+def firmware_build_from_version(text: str) -> int | None:
+    """Номер dN из ответа ноды на `ver`; None, если версия не распознана."""
+    m = _VER_BUILD_RE.search(text or "")
+    return int(m.group(1)) if m else None
 
 
 def list_firmware_releases(timeout: float = 15.0) -> list[dict]:

@@ -42,7 +42,7 @@ from dataclasses import dataclass
 
 
 APP_NAME = "Dark Flasher"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 
 DEST_NAME = "FW.UF2"          # короткое 8.3-имя: никаких сюрпризов с LFN
 CHUNK_SIZE = 16 * 1024
@@ -136,6 +136,16 @@ FLAG_NAME = 1 << 0
 FLAG_RADIO = 1 << 1
 FLAG_CAPACITY = 1 << 2
 FLAG_MODULE = 1 << 3
+FLAG_LOWBATT = 1 << 4          # V-cut: порог отключения по низкому напряжению
+
+# Байты возможностей в резерве заголовка блока заводских настроек (смещение 18
+# от метки: метка 16 + версия + длина). Заготовка прошивки d12 и новее пишет
+# здесь 'V' + версию списка возможностей. До неё прошивка флаг FLAG_LOWBATT не
+# знает и молча пропустит, а блок запомнит как применённый — значение
+# потерялось бы навсегда, даже после обновления. Поэтому вшиваем V-cut только
+# туда, где возможность объявлена.
+FACTORY_CAP_VCUT = b"V\x01"
+FACTORY_CAP_OFFSET = 18
 
 
 def _utf8_prefix(text: str, max_bytes: int) -> bytes:
@@ -153,11 +163,32 @@ def _utf8_prefix(text: str, max_bytes: int) -> bytes:
     return b""
 
 
-def pack_factory_payload(settings: dict) -> tuple[bytes, int]:
+def factory_caps(image: bytes, pos: int) -> set[str]:
+    """Что прошивка умеет брать из блока заводских настроек.
+
+    Поля блока добавлялись по одному, и старая прошивка не знает новых флагов:
+    она молча пропустит неизвестный бит, но блок запомнит как применённый —
+    новое значение не приедет уже никогда. Поэтому вшиваем только то, что
+    заготовка блока объявила в резерве заголовка (см. FACTORY_CAP_VCUT).
+
+    `pos` — смещение блока в образе: его находит find_factory_blob().
+    """
+    caps: set[str] = set()
+    if bytes(image[pos + FACTORY_CAP_OFFSET:
+                   pos + FACTORY_CAP_OFFSET + len(FACTORY_CAP_VCUT)]) \
+            == FACTORY_CAP_VCUT:
+        caps.add("vcut")
+    return caps
+
+
+def pack_factory_payload(settings: dict,
+                         caps: set[str] | frozenset[str] = frozenset()
+                         ) -> tuple[bytes, int]:
     """Собирает 128-байтовую полезную часть и набор флагов «что применять».
 
     Флаги `use_*` из окна: выключенная настройка не попадает ни в блок, ни в
-    набор флагов — прошивка её просто не трогает.
+    набор флагов — прошивка её просто не трогает. `caps` — что эта конкретная
+    прошивка умеет читать из блока (см. factory_caps).
     """
     buf = bytearray(FACTORY_PAYLOAD)
     flags = 0
@@ -217,6 +248,20 @@ def pack_factory_payload(settings: dict) -> tuple[bytes, int]:
         buf[46] = module & 0xFF
         flags |= FLAG_MODULE
 
+    if settings.get("use_lowbat", True):
+        try:
+            lowbat = int(settings.get("lowbat") or 0)
+        except (TypeError, ValueError) as e:
+            raise Uf2Error("V-cut: в настройках не число") from e
+        if not (0 <= lowbat <= 40):
+            raise Uf2Error("V-cut вне диапазона 0..4.0 В")
+        # 0 — штатные 3.40 В: менять на ноде нечего. Иначе пишем порог в
+        # low_batt_mv100 (100 мВ на единицу) — но только если прошивка его
+        # читает, иначе он молча пропадёт.
+        if lowbat and "vcut" in caps:
+            buf[50] = lowbat & 0xFF
+            flags |= FLAG_LOWBATT
+
     buf[51] = flags
     return bytes(buf), flags
 
@@ -261,9 +306,15 @@ def find_factory_blob(image: bytes) -> int:
     return found[0]
 
 
-def patch_factory_cfg(image: bytearray, payload: bytes) -> dict:
-    """Вписывает полезную часть в образ на месте метки. Возвращает статистику."""
-    pos = find_factory_blob(bytes(image))
+def patch_factory_cfg(image: bytearray, payload: bytes,
+                      pos: int | None = None) -> dict:
+    """Вписывает полезную часть в образ на месте метки. Возвращает статистику.
+
+    `pos` — уже найденное смещение блока (find_factory_blob); если не задано,
+    ищем здесь.
+    """
+    if pos is None:
+        pos = find_factory_blob(bytes(image))
 
     version = image[pos + 16]
     if version != FACTORY_VERSION:
@@ -288,10 +339,11 @@ def apply_factory_cfg_to_uf2(src_path: str, dst_path: str,
     разнесла бы блоки. Блоки пересобираются с теми же адресами, размерами и
     номерами — структура файла не меняется, только байты данных.
     """
-    payload, flags = pack_factory_payload(settings)
     image, base, blocks = uf2_to_image(src_path)
+    pos = find_factory_blob(image)
+    payload, flags = pack_factory_payload(settings, factory_caps(image, pos))
     img = bytearray(image)
-    stats = patch_factory_cfg(img, payload)
+    stats = patch_factory_cfg(img, payload, pos)
 
     with open(src_path, "rb") as src:
         data = bytearray(src.read())
@@ -318,7 +370,8 @@ def apply_factory_cfg_to_uf2(src_path: str, dst_path: str,
             except OSError:
                 pass
     stats.update({"flags": flags, "size": os.path.getsize(dst_path),
-                  "blocks": total, "base": base, "image": len(img)})
+                  "blocks": total, "base": base, "image": len(img),
+                  "vcut": bool(flags & FLAG_LOWBATT)})
     return stats
 
 

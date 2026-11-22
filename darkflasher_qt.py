@@ -1,4 +1,4 @@
-"""Dark Flasher 1.5.0 — интерфейс на PyQt6.
+"""Dark Flasher 1.6.0 — интерфейс на PyQt6.
 
 Логика записи UF2, поиска тома и COM взята из DarkFlasher.py и darktec_cfg.py;
 здесь только окно, стили и связи.
@@ -30,9 +30,10 @@ from PyQt6.QtWidgets import (
 
 import darktec_cfg as cfg
 from DarkFlasher import (
-    APP_NAME, APP_VERSION, ERASE_IMAGE, ERASE_IMAGE_SHA256, FlashJob,
-    FlashResult, Uf2Error, Uf2Info, UF2_FAMILY_NRF52840, VolumeWatcher,
-    apply_factory_cfg_to_uf2, build_dfu_zip_from_image, family_name, fmt_size,
+    APP_NAME, APP_VERSION, ERASE_IMAGE, ERASE_IMAGE_SHA256, FLAG_LOWBATT,
+    FlashJob, FlashResult, Uf2Error, Uf2Info, UF2_FAMILY_NRF52840,
+    VolumeWatcher, apply_factory_cfg_to_uf2, build_dfu_zip_from_image,
+    factory_caps, family_name, find_factory_blob, fmt_size,
     pack_factory_payload, patch_factory_cfg, resource_path, uf2_to_image,
     uf2_upload_size,
 )
@@ -47,6 +48,16 @@ DEV_PIN_HASH = "2e0066cb6715194d0feb9a2c1f5400c9d99e7727399bd0c903d02d3880053705
 # при обычном размере не появлялся столбик прокрутки (лэйаут и шрифты дают
 # размер чуть позже, чем считает sizeHint).
 FIT_RESERVE = 10
+
+# V-cut: порог отключения по низкому напряжению, в 100 мВ на единицу. Значения
+# те же, что листает меню `[ Darktec ]` на ноде; 0 — штатные 3.40 В.
+VCUT_STEPS: list[tuple[int, str]] = [
+    (0, "3.40 В · штатный"),
+    (30, "3.00 В"),
+    (25, "2.50 В"),
+    (20, "2.00 В"),
+    (10, "1.00 В"),
+]
 
 
 def dev_pin_ok(pin: str) -> bool:
@@ -492,6 +503,9 @@ class MainWindow(QMainWindow):
         self._dev_signature: tuple = ()
         self._module_pref = bool(self.settings.get("use_module", True))
         self._lr2021 = False
+        # Просили ли вшить V-cut в собираемый образ (для предупреждения, если
+        # прошивка его из блока не читает).
+        self._build_wanted_vcut = False
         self.manual_source = False
         self._manual_flash = False
         self._flashing = False
@@ -789,6 +803,7 @@ class MainWindow(QMainWindow):
             "use_tx": "Передавать мощность передачи",
             "use_module": "Передавать радиомодуль",
             "use_capacity": "Передавать ёмкость батареи",
+            "use_lowbat": "Передавать порог V-cut (штатный — не трогать)",
             "use_adc": "Передавать коэффициент АЦП по USB "
                        "(в UF2/OTA не вшивается)",
         }
@@ -857,6 +872,27 @@ class MainWindow(QMainWindow):
         add_line(right, "Мощность, dBm", "tx", "-9..22", "use_tx")
         add_line(right, "Ёмкость, мАч", "capacity", "1000..10000",
                  "use_capacity")
+
+        vcut_lb = QLabel("V-cut")
+        vcut_lb.setObjectName("fieldLabel")
+        self.vcut_box = QComboBox()
+        self.vcut_box.setFixedWidth(150)
+        for mv100, title in VCUT_STEPS:
+            self.vcut_box.addItem(title, mv100)
+        try:
+            cur_vcut = int(self.settings.get("lowbat") or 0)
+        except (TypeError, ValueError):
+            cur_vcut = 0
+        vcut_idx = next((i for i, (v, _t) in enumerate(VCUT_STEPS)
+                         if v == cur_vcut), 0)
+        self.vcut_box.setCurrentIndex(vcut_idx)
+        self.vcut_box.setToolTip(
+            "Порог отключения по низкому напряжению. Штатный — 3.40 В; ниже — "
+            "для стенда с ЛБП и слабых банок")
+        self.vcut_box.currentIndexChanged.connect(
+            lambda _i: self._on_setting_changed())
+        right.addRow(vcut_lb, field_row(self.vcut_box, "use_lowbat"))
+        self.combos["lowbat"] = self.vcut_box
 
         mod_lb = QLabel("Радиомодуль")
         mod_lb.setObjectName("fieldLabel")
@@ -1244,6 +1280,8 @@ class MainWindow(QMainWindow):
             off.append("радиомодуль")
         if not settings.get("use_capacity", True):
             off.append("ёмкость")
+        if not settings.get("use_lowbat", True):
+            off.append("V-cut")
         if not settings.get("use_adc", True):
             off.append("АЦП")
         return ", ".join(off)
@@ -1930,6 +1968,13 @@ class MainWindow(QMainWindow):
         if self.busy:
             self.log_msg("идёт операция — дождись окончания", "warn")
             return
+        if self.role_slug in cfg.NO_FACTORY_ROLES:
+            self.log_msg(
+                f"у роли «{cfg.role_title(self.role_slug)}» в прошивке нет "
+                f"блока заводских настроек — вшивать некуда. Настройки этой "
+                f"роли не поддерживаются, прошей как есть", "err")
+            self.set_status("настройки этой роли не вшиваются")
+            return
         if not self._validate_inputs():
             return
         rel = self.selected_release
@@ -2027,6 +2072,12 @@ class MainWindow(QMainWindow):
                 parts.append(mod_title)
         if settings.get("use_capacity", True):
             parts.append(f"{settings.get('capacity')} мАч")
+        lowbat = int(settings.get("lowbat") or 0)
+        self._build_wanted_vcut = bool(
+            settings.get("use_lowbat", True) and lowbat > 0)
+        if settings.get("use_lowbat", True):
+            parts.append("V-cut " + (
+                "штатный" if lowbat <= 0 else f"{lowbat / 10:.2f} В"))
         if settings.get("use_adc", True):
             parts.append(f"АЦП {settings.get('adc')}")
         if parts:
@@ -2050,8 +2101,10 @@ class MainWindow(QMainWindow):
                     self.q.put(("ota_progress", 0.25))
                     image, base, blocks = uf2_to_image(uf2_path)
                     img = bytearray(image)
-                    payload, _flags = pack_factory_payload(settings)
-                    patch = patch_factory_cfg(img, payload)
+                    pos = find_factory_blob(image)
+                    payload, flags = pack_factory_payload(
+                        settings, factory_caps(image, pos))
+                    patch = patch_factory_cfg(img, payload, pos)
                     self.q.put(("log", f"блок настроек: смещение 0x{patch['offset']:X} · "
                                        f"crc32 0x{patch['crc']:08X}", "dim"))
                     self.q.put(("ota_progress", 0.6))
@@ -2060,6 +2113,8 @@ class MainWindow(QMainWindow):
                         progress=lambda p: self.q.put(("ota_progress", 0.6 + 0.35 * p)))
                     stats["kind"] = "zip"
                     stats["patch_offset"] = patch["offset"]
+                    stats["flags"] = flags
+                    stats["vcut"] = bool(flags & FLAG_LOWBATT)
                 self.q.put(("ota_done", (True, out, stats)))
             except Exception as e:  # noqa: BLE001
                 self.q.put(("ota_done", (False, str(e), {"kind": kind})))
@@ -2077,12 +2132,41 @@ class MainWindow(QMainWindow):
 
     def _send_thread(self, port: str, prefix: float) -> None:
         after_flash = bool(self._after_flash)
+        proto = ("frames" if self.role_slug in ("companion_radio_ble",
+                                              "companion_radio_usb")
+                 else "text")
+        # Версию спрашиваем до сборки команд: V-cut умеет не каждая прошивка,
+        # а сорвать им всю пачку настроек нельзя.
+        ver = ""
+        try:
+            ver = cfg.read_version(port, protocol=proto)
+        except Exception as e:  # noqa: BLE001
+            self.q.put(("log", f"версия ноды не прочиталась: {e}", "dim"))
+        if ver:
+            self.q.put(("log", f"нода: {ver}", "info"))
+            if proto == "frames" and "1.18.0d" not in ver:
+                self.q.put(("log", "прошивка на ноде старая — часть команд "
+                                   "неизвестна. Прошей darktec-v1.18.0d7",
+                            "warn"))
+        build = cfg.firmware_build_from_version(ver) if ver else None
+        lowbat_ok = build is None or build >= cfg.LOWBAT_MIN_BUILD
         try:
             eff = self._effective_settings()
             skipped = self._skipped_text(eff)
             if skipped:
                 self.q.put(("log", "не передаю: " + skipped, "dim"))
-            commands = cfg.build_commands(eff)
+            try:
+                lowbat = int(eff.get("lowbat") or 0)
+            except (TypeError, ValueError):
+                lowbat = 0
+            if eff.get("use_lowbat", True) and lowbat > 0:
+                if not lowbat_ok:
+                    self.q.put(("log", f"V-cut: прошивка d{build} этой команды "
+                                       f"не знает — пропускаю, нужна d12 и "
+                                       f"новее", "warn"))
+            elif eff.get("use_lowbat", True):
+                self.q.put(("log", "V-cut: штатный — на ноду не передаю", "dim"))
+            commands = cfg.build_commands(eff, lowbat_ok=lowbat_ok)
         except Exception as e:  # noqa: BLE001
             self.q.put(("log", f"ошибка настроек: {e}", "err"))
             self.q.put(("settings_done", False, after_flash))
@@ -2092,18 +2176,7 @@ class MainWindow(QMainWindow):
                         "warn"))
             self.q.put(("settings_done", True, after_flash, True))
             return
-        proto = ("frames" if self.role_slug in ("companion_radio_ble",
-                                              "companion_radio_usb")
-                 else "text")
         try:
-            ver = cfg.read_version(port, protocol=proto)
-            if ver:
-                self.q.put(("log", f"нода: {ver}", "info"))
-                if proto == "frames" and "1.18.0d" not in ver:
-                    self.q.put(("log", "прошивка на ноде старая — часть команд "
-                                       "неизвестна. Прошей darktec-v1.18.0d7",
-                                "warn"))
-
             def progress(p: float) -> None:
                 self.q.put(("settings_progress", prefix + (1.0 - prefix) * p))
 
@@ -2198,6 +2271,8 @@ class MainWindow(QMainWindow):
             self.use_cbs["use_tx"].isChecked())
         self.fields["capacity"].setEnabled(
             self.use_cbs["use_capacity"].isChecked())
+        self.combos["lowbat"].setEnabled(
+            self.use_cbs["use_lowbat"].isChecked())
         self.fields["adc"].setEnabled(
             self.use_cbs["use_adc"].isChecked())
         self._set_radio_enabled(self.use_cbs["use_radio"].isChecked())
@@ -2315,6 +2390,13 @@ class MainWindow(QMainWindow):
                         self.log_msg(
                             f"{word} {fmt_size(stats.get('size', 0))} сохранён: "
                             f"{payload}", "file")
+                        if self._build_wanted_vcut and not stats.get("vcut"):
+                            self.log_msg(
+                                "V-cut в образ не вшит: эта прошивка его из "
+                                "блока не читает (нужна d12 и новее). На ноду "
+                                "порог можно отправить кнопкой «Отправить "
+                                "настройки»", "warn")
+                        self._build_wanted_vcut = False
                     else:
                         self.set_progress(0)
                         word = "UF2" if (stats or {}).get("kind") == "uf2" else "OTA"
